@@ -1,0 +1,566 @@
+#!/usr/bin/env bash
+#
+# task-worktree — the one blessed path for spinning, tearing down, and
+# reconciling agentic tasks in this Dispatch root.
+#
+# This is a scratch bash script. It is expected to graduate into a reusable
+# skill (its own repo) later; keep the surface small and the herdr calls
+# well-isolated so that extraction is easy.
+#
+# Subcommands:
+#   create   Create worktree(s) + ephemeral task dir + spawn an executor agent.
+#   remove   Tear down a task: herdr worktrees, symlinks, task dir, ledger.
+#   prune    Garbage-collect dangling worktree symlinks + unused repo symlinks.
+#   list     Show current task status derived from the ledger.
+#   help     Show usage.
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Layout / config
+# ---------------------------------------------------------------------------
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # the Dispatch root
+REPOS="${TASK_REPOS_DIR:-$HOME/Repositories}"               # source repos
+WORKTREE_STORE="${TASK_WORKTREE_STORE:-$HOME/agentic-workspaces/.worktrees}"
+WORKTREE_VIEW="$ROOT/worktree"                             # symlink view
+TASKS_DIR="$ROOT/tasks"                                     # ephemeral task dirs
+REPORTS_DIR="$ROOT/reports"                                 # durable task reports
+DISPATCH_DIR="$ROOT/.dispatch"
+LEDGER="$DISPATCH_DIR/ledger.jsonl"
+EXECUTOR_CONTEXT="$DISPATCH_DIR/task-executor.AGENTS.md"
+DEFAULT_AGENT_KIND="${TASK_AGENT_KIND:-pi}"
+
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf '· %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+have herdr   || die "herdr not found on PATH"
+have python3 || die "python3 not found on PATH"
+have git     || die "git not found on PATH"
+
+mkdir -p "$DISPATCH_DIR" "$WORKTREE_VIEW" "$TASKS_DIR" "$WORKTREE_STORE" "$REPORTS_DIR"
+[ -f "$LEDGER" ] || : > "$LEDGER"
+
+# ---------------------------------------------------------------------------
+# JSON helpers (herdr speaks JSON on stdout)
+# ---------------------------------------------------------------------------
+
+# jget <json> <python-expr-over-d>  -> prints result or exits non-zero
+jget() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+if isinstance(d, dict) and "error" in d:
+    sys.stderr.write("herdr error: %s\n" % d["error"].get("message", d["error"]))
+    sys.exit(3)
+try:
+    print(eval(sys.argv[2], {"d": d}))
+except Exception as e:
+    sys.stderr.write("json path failed: %s\n" % e)
+    sys.exit(4)
+PY
+}
+
+nonce() { printf '%03x' "$((RANDOM % 4096))"; }
+
+now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# ledger_append <json-object-string>
+ledger_append() { printf '%s\n' "$1" >> "$LEDGER"; }
+
+# _default_branch <repo> -> prints the repo's default branch (main/master)
+_default_branch() {
+  local repo="$1" ref c
+  ref="$(git -C "$REPOS/$repo" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  if [ -n "$ref" ]; then printf '%s\n' "${ref#origin/}"; return; fi
+  for c in main master; do
+    if git -C "$REPOS/$repo" show-ref --verify --quiet "refs/remotes/origin/$c"; then
+      printf '%s\n' "$c"; return
+    fi
+  done
+  printf 'main\n'
+}
+
+# ---------------------------------------------------------------------------
+# create
+# ---------------------------------------------------------------------------
+usage_create() {
+  cat >&2 <<EOF
+Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
+                            [--branch <name>] [--base <ref>] [--mode <mode>]
+                            [--agent <kind>] [--request "<your words>"]
+                            [--prompt "<opening instruction>"] [--no-agent]
+
+  --slug     Human slug for the task (a short nonce is appended -> the task id).
+  --repo     Repo under \$REPOS to work in. First --repo is the primary.
+             Repeat for multi-repo tasks.
+  --branch   Branch name (default: the task id).
+  --base     Base ref for new branches (default: HEAD of each repo).
+  --mode     Task lifecycle (default: 'code'):
+               code        touches the tree; stays open for review, closed later.
+               investigate read-only find/answer; reports and auto-closes itself.
+  --agent    Executor agent kind (default: \$TASK_AGENT_KIND or 'pi').
+  --request  Your original request, recorded in the ledger.
+  --prompt   Opening instruction handed to the executor agent.
+  --no-agent Prepare worktrees + task dir only; do not spawn an agent.
+EOF
+}
+
+cmd_create() {
+  local slug="" branch="" base="" agent="$DEFAULT_AGENT_KIND"
+  local request="" prompt="" no_agent=0 mode="code"
+  local -a repos=()
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --slug)    slug="$2"; shift 2 ;;
+      --repo)    repos+=("$2"); shift 2 ;;
+      --branch)  branch="$2"; shift 2 ;;
+      --base)    base="$2"; shift 2 ;;
+      --mode)    mode="$2"; shift 2 ;;
+      --agent)   agent="$2"; shift 2 ;;
+      --request) request="$2"; shift 2 ;;
+      --prompt)  prompt="$2"; shift 2 ;;
+      --no-agent) no_agent=1; shift ;;
+      -h|--help) usage_create; return 0 ;;
+      *) die "create: unknown arg '$1'" ;;
+    esac
+  done
+
+  [ -n "$slug" ]        || { usage_create; die "create: --slug required"; }
+  [ "${#repos[@]}" -gt 0 ] || { usage_create; die "create: at least one --repo required"; }
+  case "$mode" in
+    code|investigate) ;;
+    *) die "create: --mode must be 'code' or 'investigate' (got '$mode')" ;;
+  esac
+
+  # sanitize slug: lowercase, non-alnum -> '-'
+  slug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-//; s/-$//')"
+  [ -n "$slug" ] || die "create: --slug produced an empty slug"
+  local id="${slug}-$(nonce)"
+  [ -n "$branch" ] || branch="$id"
+
+  # validate repos exist
+  local repo
+  for repo in "${repos[@]}"; do
+    [ -d "$REPOS/$repo/.git" ] || [ -e "$REPOS/$repo/.git" ] \
+      || die "repo '$repo' is not a git repo under $REPOS"
+  done
+
+  info "task id: $id  branch: $branch  mode: $mode  repos: ${repos[*]}"
+
+  local task_dir="$TASKS_DIR/$id"
+  [ -e "$task_dir" ] && die "task dir already exists: $task_dir"
+  mkdir -p "$task_dir"
+
+  # per-repo worktree creation
+  local -a wt_workspaces=()
+  local -a wt_records=()
+  local primary="${repos[0]}"
+  for repo in "${repos[@]}"; do
+    # 1. lazy on-demand repo symlink at root
+    if [ ! -e "$ROOT/$repo" ]; then
+      ln -s "$REPOS/$repo" "$ROOT/$repo"
+      info "linked repo view: $repo -> $REPOS/$repo"
+    fi
+
+    # 2. create the worktree via herdr (authoritative)
+    local checkout="$WORKTREE_STORE/$repo/$branch"
+    # Base selection: an explicit --base always wins ("unless specified").
+    # Otherwise start from the FRESHLY-FETCHED latest main tip so we never
+    # branch off a stale local checkout.
+    local repo_base="$base"
+    if [ -z "$repo_base" ]; then
+      local main_branch; main_branch="$(_default_branch "$repo")"
+      info "fetching latest $repo/$main_branch ..."
+      git -C "$REPOS/$repo" fetch --quiet origin "$main_branch" 2>/dev/null \
+        || info "warning: fetch failed for $repo (continuing from local ref)"
+      repo_base="origin/$main_branch"
+    fi
+    info "base: $repo @ $repo_base"
+    local -a base_args=(--base "$repo_base")
+    local out
+    out="$(herdr worktree create \
+      --cwd "$REPOS/$repo" \
+      --branch "$branch" \
+      ${base_args[@]+"${base_args[@]}"} \
+      --path "$checkout" \
+      --label "$repo" \
+      --no-focus 2>&1)" || { printf '%s\n' "$out" >&2; die "herdr worktree create failed for $repo"; }
+
+    local wsid path
+    wsid="$(jget "$out" "d['result']['workspace']['workspace_id']")"
+    path="$(jget "$out" "d['result']['worktree']['path']")"
+    wt_workspaces+=("$wsid")
+    info "worktree: $repo@$branch -> $path (ws $wsid)"
+
+    # 3. symlink into the flat worktree view
+    mkdir -p "$WORKTREE_VIEW/$repo/$(dirname "$branch")"
+    ln -sfn "$path" "$WORKTREE_VIEW/$repo/$branch"
+
+    # 4. symlink into the ephemeral task dir (executor's isolated view)
+    ln -sfn "$WORKTREE_VIEW/$repo/$branch" "$task_dir/$repo"
+
+    wt_records+=("{\"repo\":\"$repo\",\"branch\":\"$branch\",\"workspace_id\":\"$wsid\",\"path\":\"$path\"}")
+  done
+
+  # executor AGENTS.md into the task dir
+  ln -sfn "$EXECUTOR_CONTEXT" "$task_dir/AGENTS.md"
+
+  # spawn executor agent in an isolated workspace rooted at the task dir
+  local exec_wsid="" exec_pane=""
+  if [ "$no_agent" -eq 0 ]; then
+    local out
+    out="$(herdr workspace create --cwd "$task_dir" --label "$id" --no-focus 2>&1)" \
+      || { printf '%s\n' "$out" >&2; die "herdr workspace create failed"; }
+    exec_wsid="$(jget "$out" "d['result']['workspace']['workspace_id']")"
+    exec_pane="$(jget "$out" "d['result']['root_pane']['pane_id']")"
+    info "executor workspace: $exec_wsid  pane: $exec_pane"
+
+    herdr agent start "$id" --kind "$agent" --pane "$exec_pane" >/dev/null 2>&1 \
+      || die "herdr agent start failed (kind=$agent pane=$exec_pane)"
+    info "started $agent agent '$id'"
+
+    if [ -n "$prompt" ]; then
+      local full="$prompt
+
+Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch)."
+      herdr agent prompt "$id" "$full" >/dev/null 2>&1 \
+        || info "warning: agent prompt submission failed; brief the agent manually"
+    fi
+
+    # Background watcher: never blocks Dispatch. Waits for the executor to
+    # settle, records a DURABLE settle event to the ledger (so the result can
+    # never be lost even if every wake fails), pings the human with a desktop
+    # notification, then wakes Dispatch — retrying so a transient busy state
+    # doesn't drop the wake. The human can carry on the whole time; Dispatch
+    # reacts to the wake (or reads the ledger on its next turn). No polling.
+    local dispatch_pane="${DISPATCH_PANE_ID:-${HERDR_PANE_ID:-}}"
+    nohup bash -c '
+      id="$1"; disp="$2"; ledger="$3"
+      ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
+      # ensure we saw it start working before waiting for it to settle
+      herdr agent wait "$id" --until working --timeout 30000 >/dev/null 2>&1 || true
+      herdr agent wait "$id" --until idle done blocked >/dev/null 2>&1 || true
+      # distinguish a blocked settle from a clean one (no polling; single probes)
+      if herdr agent wait "$id" --until blocked --timeout 500 >/dev/null 2>&1; then
+        status="blocked"
+      else
+        status="awaiting-dispatch"
+      fi
+      # 1. DURABLE record — append-only, survives any wake failure; makes
+      #    bin/task-worktree list accurate without live polling.
+      printf "%s\n" "{\"event\":\"settled\",\"id\":\"$id\",\"status\":\"$status\",\"ts\":\"$(ts)\"}" >> "$ledger"
+      # 2. notify the human (covers the window if every wake retry fails)
+      herdr notification show "Task $id settled ($status)" \
+        --body "Recorded to ledger — Dispatch will report." >/dev/null 2>&1 || true
+      # 3. wake Dispatch, retrying so a transient busy/blocked state can'"'"'t
+      #    silently swallow the wake.
+      if [ -n "$disp" ]; then
+        msg="[task-watcher] Executor $id settled ($status). Run bin/task-worktree list, inspect it (herdr agent read $id), reconcile the ledger, push the branch, then flip it to awaiting-review and surface the result to the human."
+        for attempt in 1 2 3 4 5; do
+          herdr agent prompt "$disp" "$msg" >/dev/null 2>&1 && break
+          sleep 10
+        done
+      fi
+    ' _ "$id" "$dispatch_pane" "$LEDGER" >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+    info "watcher armed → record settle + notify + wake Dispatch (${dispatch_pane:-unknown}) when $id settles"
+  fi
+
+  # ledger entry
+  local wts; wts="$(IFS=,; echo "${wt_records[*]}")"
+  local entry
+  entry="$(python3 - "$id" "$slug" "$branch" "$primary" "$agent" \
+                    "$request" "$prompt" "$exec_wsid" "$mode" "$(now)" "$wts" <<'PY'
+import json, sys
+(id_, slug, branch, primary, agent, request, prompt, exec_ws, mode, ts, wts) = sys.argv[1:12]
+print(json.dumps({
+    "event": "created",
+    "id": id_, "slug": slug, "branch": branch, "primary_repo": primary,
+    "agent_kind": agent, "mode": mode, "request": request, "prompt": prompt,
+    "executor_workspace_id": exec_ws or None,
+    "worktrees": json.loads("[" + wts + "]"),
+    "status": "working", "ts": ts,
+}))
+PY
+)"
+  ledger_append "$entry"
+
+  printf '\n✔ task %s ready\n  task dir: %s\n' "$id" "$task_dir" >&2
+  echo "$id"
+}
+
+# ---------------------------------------------------------------------------
+# remove
+# ---------------------------------------------------------------------------
+usage_remove() {
+  cat >&2 <<EOF
+Usage: task-worktree remove <task-id> [--delete-branch]
+
+  Tears down herdr worktree workspaces, the executor workspace, the flat
+  worktree symlinks, the ephemeral task dir, and unused repo symlinks.
+  The git branch is kept by default (it holds the work); pass --delete-branch
+  to also delete it.
+EOF
+}
+
+# _find_created_rec <id>  -> prints the latest 'created' ledger record (or empty)
+_find_created_rec() {
+  python3 - "$LEDGER" "$1" <<'PY'
+import json, sys
+path, id_ = sys.argv[1], sys.argv[2]
+found = None
+for line in open(path):
+    line = line.strip()
+    if not line: continue
+    try: o = json.loads(line)
+    except Exception: continue
+    if o.get("id") == id_ and o.get("event") == "created":
+        found = o
+print(json.dumps(found) if found else "")
+PY
+}
+
+# _teardown_from_rec <rec-json> <delete_branch 0|1> <id>
+# Tears down herdr worktrees, the executor workspace, view symlinks, the task
+# dir, and records a 'closed' event. Shared by `remove` and investigate
+# auto-close. Callers must persist any report BEFORE invoking this.
+_teardown_from_rec() {
+  local rec="$1" delete_branch="$2" id="$3"
+
+  python3 - "$rec" <<'PY' | while IFS=$'\t' read -r wsid repo branch path; do
+import json, sys
+o = json.loads(sys.argv[1])
+for w in o.get("worktrees", []):
+    print("\t".join([w["workspace_id"], w["repo"], w["branch"], w["path"]]))
+PY
+    info "removing worktree $repo@$branch (ws $wsid)"
+    herdr worktree remove --workspace "$wsid" --force >/dev/null 2>&1 \
+      || info "warning: herdr worktree remove failed for $wsid (continuing)"
+    rm -f "$WORKTREE_VIEW/$repo/$branch"
+    if [ "$delete_branch" -eq 1 ]; then
+      git -C "$REPOS/$repo" branch -D "$branch" >/dev/null 2>&1 \
+        && info "deleted branch $repo@$branch" || true
+    fi
+  done
+
+  local exec_ws; exec_ws="$(jget "$rec" "d.get('executor_workspace_id') or ''" 2>/dev/null || true)"
+  if [ -n "$exec_ws" ] && [ "$exec_ws" != "None" ]; then
+    herdr workspace close "$exec_ws" >/dev/null 2>&1 \
+      && info "closed executor workspace $exec_ws" || true
+  fi
+
+  rm -rf "${TASKS_DIR:?}/$id"
+  find "$WORKTREE_VIEW" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  prune_repo_symlinks
+
+  ledger_append "{\"event\":\"closed\",\"id\":\"$id\",\"status\":\"closed\",\"ts\":\"$(now)\"}"
+  info "task $id closed"
+}
+
+cmd_remove() {
+  local id="" delete_branch=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --delete-branch) delete_branch=1; shift ;;
+      -h|--help) usage_remove; return 0 ;;
+      -*) die "remove: unknown arg '$1'" ;;
+      *) id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_remove; die "remove: task id required"; }
+
+  local rec; rec="$(_find_created_rec "$id")"
+  [ -n "$rec" ] || die "no ledger record for task '$id'"
+  _teardown_from_rec "$rec" "$delete_branch" "$id"
+}
+
+# ---------------------------------------------------------------------------
+# report
+# ---------------------------------------------------------------------------
+usage_report() {
+  cat >&2 <<EOF
+Usage: task-worktree report <task-id> [--status <status>] [--note <text>]
+                            [--commit <sha>] [--body <text> | --body-file <path>]
+
+  Persists the executor's report DURABLY — first to reports/<id>.md, then as a
+  'reported' ledger event — BEFORE any teardown, so it can never be lost.
+
+  If the task was created with --mode investigate, it then auto-closes itself
+  (teardown + branch delete, nothing to review). A --mode code task is left open
+  at its report status for human review and explicit 'remove' later.
+
+  --status   Report status (default: awaiting-review).
+  --note     One-line summary recorded in the ledger.
+  --commit   Commit SHA to record (code tasks).
+  --body     Full report text (markdown) for reports/<id>.md.
+  --body-file  Read the full report text from a file instead of --body.
+EOF
+}
+
+cmd_report() {
+  local id="" status="" note="" commit="" body="" body_file=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --status)    status="$2"; shift 2 ;;
+      --note)      note="$2"; shift 2 ;;
+      --commit)    commit="$2"; shift 2 ;;
+      --body)      body="$2"; shift 2 ;;
+      --body-file) body_file="$2"; shift 2 ;;
+      -h|--help)   usage_report; return 0 ;;
+      -*) die "report: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "report: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_report; die "report: task id required"; }
+
+  local rec; rec="$(_find_created_rec "$id")"
+  [ -n "$rec" ] || die "report: no ledger record for task '$id'"
+  local mode; mode="$(jget "$rec" "d.get('mode') or 'code'")"
+  [ -n "$status" ] || status="awaiting-review"
+
+  if [ -n "$body_file" ]; then
+    [ -f "$body_file" ] || die "report: --body-file not found: $body_file"
+    body="$(cat "$body_file")"
+  fi
+
+  # 1. DURABLE report file first — human-readable, survives any teardown.
+  mkdir -p "$REPORTS_DIR"
+  local report_file="$REPORTS_DIR/$id.md"
+  {
+    printf '%s\n\n' "# Task report: $id"
+    printf '%s\n' "- **status:** $status"
+    printf '%s\n' "- **mode:** $mode"
+    [ -n "$commit" ] && printf '%s\n' "- **commit:** $commit"
+    printf '%s\n\n' "- **ts:** $(now)"
+    [ -n "$note" ] && printf '%s\n\n' "**note:** $note"
+    printf '%s\n\n' '---'
+    printf '%s\n' "$body"
+  } > "$report_file"
+  info "report persisted: ${report_file#$ROOT/}"
+
+  # 2. Ledger 'reported' event pointing at the durable file.
+  local entry
+  entry="$(python3 - "$id" "$status" "$note" "$commit" "$mode" "reports/$id.md" "$(now)" <<'PY'
+import json, sys
+(id_, status, note, commit, mode, rf, ts) = sys.argv[1:8]
+print(json.dumps({
+    "event": "reported", "id": id_, "status": status,
+    "note": note or None, "commit": commit or None, "mode": mode,
+    "report_file": rf, "ts": ts,
+}))
+PY
+)"
+  ledger_append "$entry"
+
+  # 3. Investigate tasks auto-close (report is already safely persisted).
+  if [ "$mode" = "investigate" ]; then
+    info "mode=investigate → auto-closing $id"
+    _teardown_from_rec "$rec" 1 "$id"
+  else
+    info "mode=code → task $id left open at '$status' for review"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# prune
+# ---------------------------------------------------------------------------
+# Remove dangling worktree-view symlinks (target gone) and unused repo symlinks.
+prune_repo_symlinks() {
+  local link repo
+  for link in "$ROOT"/*; do
+    [ -L "$link" ] || continue
+    repo="$(basename "$link")"
+    # skip the worktree view dir itself (not a symlink) — only symlinks reach here
+    local target; target="$(readlink "$link")"
+    case "$target" in
+      "$REPOS"/*) ;;      # a repo view symlink — candidate
+      *) continue ;;
+    esac
+    # is it still referenced by any worktree view entry?
+    if [ -d "$WORKTREE_VIEW/$repo" ] && [ -n "$(ls -A "$WORKTREE_VIEW/$repo" 2>/dev/null)" ]; then
+      continue
+    fi
+    rm -f "$link"
+    info "pruned unused repo view: $repo"
+  done
+}
+
+cmd_prune() {
+  # 1. dangling worktree-view symlinks
+  if [ -d "$WORKTREE_VIEW" ]; then
+    while IFS= read -r link; do
+      [ -e "$link" ] && continue   # target still resolves -> keep
+      rm -f "$link"
+      info "pruned dangling worktree symlink: ${link#$ROOT/}"
+    done < <(find "$WORKTREE_VIEW" -type l 2>/dev/null)
+    # tidy empty dirs
+    find "$WORKTREE_VIEW" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+  fi
+  # 2. unused repo symlinks
+  prune_repo_symlinks
+  info "prune complete"
+}
+
+# ---------------------------------------------------------------------------
+# list
+# ---------------------------------------------------------------------------
+cmd_list() {
+  python3 - "$LEDGER" <<'PY'
+import json, sys
+path = sys.argv[1]
+state = {}
+order = []
+for line in open(path):
+    line = line.strip()
+    if not line: continue
+    try: o = json.loads(line)
+    except Exception: continue
+    tid = o.get("id")
+    if not tid: continue
+    if tid not in state: order.append(tid)
+    state.setdefault(tid, {}).update(o)
+if not order:
+    print("(no tasks in ledger)"); sys.exit(0)
+w = max(len(t) for t in order)
+for tid in order:
+    o = state[tid]
+    repos = ",".join(w_["repo"] for w_ in o.get("worktrees", [])) or "-"
+    print(f"{tid:<{w}}  {o.get('status','?'):<12}  {repos:<20}  {o.get('request','')[:60]}")
+PY
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+usage() {
+  cat >&2 <<EOF
+task-worktree — blessed path for agentic tasks in this Dispatch root
+
+Usage: task-worktree <create|report|remove|prune|list|help> [args]
+
+  create   Spin a task: worktree(s) + ephemeral task dir + executor agent.
+  report   Persist an executor's report durably; auto-close if --mode investigate.
+  remove   Close a task and clean up (keeps the branch by default).
+  prune    Reconcile: drop dangling worktree symlinks + unused repo links.
+  list     Show task status from the ledger.
+
+Run 'task-worktree <cmd> --help' for details.
+EOF
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    create) cmd_create "$@" ;;
+    report) cmd_report "$@" ;;
+    remove) cmd_remove "$@" ;;
+    prune)  cmd_prune "$@" ;;
+    list)   cmd_list "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; die "unknown command '$cmd'" ;;
+  esac
+}
+
+main "$@"

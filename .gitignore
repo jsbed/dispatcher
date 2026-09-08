@@ -1,0 +1,15 @@
+# Dispatch harness repo.
+# We track the agent-harness TOOLING only — never the task state that flows
+# through it (worktrees, executor dirs, reports, the ledger, repo symlinks).
+
+# Ignore everything at the root by default …
+/*
+
+# … then allow just the harness tooling back in.
+!/.gitignore
+!/AGENTS.md
+!/bin/
+!/.dispatch/
+
+# Within .dispatch, the ledger is per-task state, not tooling.
+/.dispatch/ledger.jsonl
