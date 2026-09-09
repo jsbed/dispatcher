@@ -239,9 +239,47 @@ Read ./AGENTS.md first — it defines how you must operate as a task executor. P
     nohup bash -c '
       id="$1"; disp="$2"; ledger="$3"
       ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-      # ensure we saw it start working before waiting for it to settle
-      herdr agent wait "$id" --until working --timeout 30000 >/dev/null 2>&1 || true
-      herdr agent wait "$id" --until idle done blocked >/dev/null 2>&1 || true
+      # DEBOUNCE: seconds the executor must stay settled before we trust a
+      # settle. A freshly-booted agent momentarily reports idle/done BEFORE it
+      # actually starts working, so a single wait can latch onto that boot
+      # transient and fire a false settle. We defend two ways: (1) require
+      # having WITNESSED a genuine working phase, and (2) require the settle to
+      # persist across the debounce window (re-probe; if it went back to
+      # working, keep waiting). These are cheap short sleeps in the DETACHED
+      # watcher — they never block Dispatch.
+      debounce="${TASK_WATCH_DEBOUNCE:-5}"
+
+      # Short-timeout probes of the CURRENT agent state (no polling loop; each
+      # is a single bounded wait). is_working confirms the agent is genuinely
+      # in a work phase right now; is_settled confirms idle/done/blocked now.
+      is_working() { herdr agent wait "$id" --until working --timeout 500 >/dev/null 2>&1; }
+      is_settled() { herdr agent wait "$id" --until idle done blocked --timeout 500 >/dev/null 2>&1; }
+
+      # Phase 1 — WITNESS a genuine work phase. The boot transient can satisfy a
+      # bare "--until working" wait, so we additionally require a fresh probe to
+      # read the agent as actually working. Retry (bounded) so a slow start or a
+      # boot-time idle/done can never masquerade as "already settled". If the
+      # agent never shows work across all attempts (e.g. a genuinely fast task
+      # that finished before we looked), fall through rather than hang forever.
+      witnessed=0
+      for _ in 1 2 3 4 5 6; do
+        herdr agent wait "$id" --until working --timeout 30000 >/dev/null 2>&1 || true
+        if is_working; then witnessed=1; break; fi
+        sleep "$debounce"
+      done
+
+      # Phase 2 — wait for a settle that HOLDS across the debounce window.
+      while :; do
+        herdr agent wait "$id" --until idle done blocked >/dev/null 2>&1 || true
+        sleep "$debounce"
+        # Resumed work during the window? Not a real settle — keep waiting.
+        if is_working; then continue; fi
+        # Once we have witnessed real work, insist the agent still reads as
+        # settled now (guards against a transient/transition read).
+        if [ "$witnessed" -eq 1 ] && ! is_settled; then continue; fi
+        break
+      done
+
       # distinguish a blocked settle from a clean one (no polling; single probes)
       if herdr agent wait "$id" --until blocked --timeout 500 >/dev/null 2>&1; then
         status="blocked"
