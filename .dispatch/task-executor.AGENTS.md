@@ -21,6 +21,10 @@ file. Stay inside your lane.
 5. **Finish cleanly.** When done, make sure your changes are committed and pushed,
    then stop (go idle) with a short summary of what you did and how to verify it.
    Dispatch watches your state and will flip you to `awaiting-review`.
+   **Always include a GitHub compare link** for your branch against its base
+   (`https://github.com/<org>/<repo>/compare/<base>...<your-branch>`, base is
+   usually `main`) in your final summary so Dispatch can hand it straight to the
+   human for review.
 6. **Report blockers early.** If you're blocked (missing info, failing setup,
    ambiguous requirements, needing a decision), stop and state the blocker clearly
    rather than guessing or expanding scope.

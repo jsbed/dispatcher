@@ -56,6 +56,12 @@ bin/task-worktree create \
 - The script creates worktrees via herdr, wires the symlink view, builds an
   isolated `tasks/<id>/` dir, boots the executor agent there, briefs it, and
   appends a ledger entry. It prints the task id on stdout.
+- **Code tasks: surface the GitHub compare link (`main...<branch>`) when the task
+  is DONE — not at spawn time.** The settle wake fired by the watcher carries the
+  compare link (`Show the human this GitHub compare link: <url>`); when that wake
+  arrives, display the link to the human alongside the report. `report` also
+  records the compare link in `reports/<id>.md` for durability, and executors
+  include it in their final report. Do not paste the compare link at spawn time.
 
 ## What lives where
 
@@ -86,14 +92,18 @@ bin/task-worktree           this blessed script
   pushes you, or (b) opportunistically on any turn the human already started, via
   `bin/task-worktree list`. Between those moments you stay idle and available. A
   single one-shot `herdr agent list` snapshot is fine; a `sleep`/loop never is.
-- **Tasks always run in the background.** `create` arms a detached watcher that
-  waits for the executor to settle, **records a durable `settled` event to the
-  ledger** (status `awaiting-dispatch`, or `blocked`), fires a desktop
-  notification, then wakes Dispatch with a `[task-watcher]` self-prompt — retrying
-  so a transient busy state can't drop it. Because the settle is recorded to the
-  ledger, a lost wake never loses the result: `bin/task-worktree list` still shows
-  it, and you'll catch it on the human's next turn. Do NOT ask the human whether to
-  wait — let them carry on; you'll be woken automatically.
+- **Tasks always run in the background.** `create` arms a detached, **re-arming**
+  watcher that fires on **every** settle of the executor: each time it goes idle
+  it **records a durable `settled` event to the ledger** (status
+  `awaiting-dispatch`, or `blocked`), fires a desktop notification, then wakes
+  Dispatch with a `[task-watcher]` self-prompt — retrying so a transient busy
+  state can't drop it. After firing it waits for the executor to resume work
+  before watching for the next settle, so a task that settles → resumes → settles
+  again reports its state each time (and one dropped wake can never leave you
+  permanently blind). Because every settle is recorded to the ledger, a lost wake
+  never loses the result: `bin/task-worktree list` still shows it, and you'll
+  catch it on the human's next turn. Do NOT ask the human whether to wait — let
+  them carry on; you'll be woken automatically.
 - When a wake arrives (or you spot an `awaiting-dispatch` task in `list`):
   1. `herdr agent read <id>` to read the executor's final report **before the
      agent workspace can be torn down** (once closed you can't read it again).

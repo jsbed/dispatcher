@@ -81,6 +81,24 @@ _default_branch() {
   printf 'main\n'
 }
 
+# _compare_url <repo> <branch> -> prints the GitHub compare link (main...branch)
+# Converts the origin remote (git@ or https) to https and builds the compare URL
+# against the repo's default branch. Prints nothing if origin isn't GitHub.
+_compare_url() {
+  local repo="$1" branch="$2" url base slug
+  url="$(git -C "$REPOS/$repo" remote get-url origin 2>/dev/null || true)"
+  [ -n "$url" ] || return 0
+  case "$url" in
+    git@github.com:*) slug="${url#git@github.com:}" ;;
+    https://github.com/*) slug="${url#https://github.com/}" ;;
+    ssh://git@github.com/*) slug="${url#ssh://git@github.com/}" ;;
+    *) return 0 ;;
+  esac
+  slug="${slug%.git}"
+  base="$(_default_branch "$repo")"
+  printf 'https://github.com/%s/compare/%s...%s\n' "$slug" "$base" "$branch"
+}
+
 # ---------------------------------------------------------------------------
 # create
 # ---------------------------------------------------------------------------
@@ -236,8 +254,12 @@ Read ./AGENTS.md first — it defines how you must operate as a task executor. P
     # doesn't drop the wake. The human can carry on the whole time; Dispatch
     # reacts to the wake (or reads the ledger on its next turn). No polling.
     local dispatch_pane="${DISPATCH_PANE_ID:-${HERDR_PANE_ID:-}}"
+    # Compare link (code tasks only) computed now so the settle wake can carry it
+    # — the executor "reaching" Dispatch on completion delivers the link to show.
+    local watch_compare=""
+    [ "$mode" = "code" ] && watch_compare="$(_compare_url "$primary" "$branch")"
     nohup bash -c '
-      id="$1"; disp="$2"; ledger="$3"
+      id="$1"; disp="$2"; ledger="$3"; compare="$4"
       ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
       # DEBOUNCE: seconds the executor must stay settled before we trust a
       # settle. A freshly-booted agent momentarily reports idle/done BEFORE it
@@ -255,12 +277,14 @@ Read ./AGENTS.md first — it defines how you must operate as a task executor. P
       is_working() { herdr agent wait "$id" --until working --timeout 500 >/dev/null 2>&1; }
       is_settled() { herdr agent wait "$id" --until idle done blocked --timeout 500 >/dev/null 2>&1; }
 
-      # Phase 1 — WITNESS a genuine work phase. The boot transient can satisfy a
-      # bare "--until working" wait, so we additionally require a fresh probe to
-      # read the agent as actually working. Retry (bounded) so a slow start or a
-      # boot-time idle/done can never masquerade as "already settled". If the
-      # agent never shows work across all attempts (e.g. a genuinely fast task
-      # that finished before we looked), fall through rather than hang forever.
+      # Phase 1 — WITNESS a genuine work phase (FIRST cycle only). The boot
+      # transient can satisfy a bare "--until working" wait, so we additionally
+      # require a fresh probe to read the agent as actually working. Retry
+      # (bounded) so a slow start or a boot-time idle/done can never masquerade
+      # as "already settled". If the agent never shows work across all attempts
+      # (a genuinely fast task that finished before we looked), fall through.
+      # After the first cycle the re-arm step below explicitly waits for a fresh
+      # working phase, so witnessing is inherent from then on.
       witnessed=0
       for _ in 1 2 3 4 5 6; do
         herdr agent wait "$id" --until working --timeout 30000 >/dev/null 2>&1 || true
@@ -268,42 +292,58 @@ Read ./AGENTS.md first — it defines how you must operate as a task executor. P
         sleep "$debounce"
       done
 
-      # Phase 2 — wait for a settle that HOLDS across the debounce window.
+      # RE-ARMING LOOP: report EVERY settle. After each settle we wake Dispatch
+      # with the current state, then wait for the executor to resume work before
+      # watching for the next settle. If it never resumes (task truly done) the
+      # re-arm wait blocks harmlessly in this DETACHED watcher forever — zero
+      # cost to Dispatch. This way each idle transition surfaces its state, and
+      # a single dropped wake can never leave Dispatch permanently blind.
       while :; do
-        herdr agent wait "$id" --until idle done blocked >/dev/null 2>&1 || true
-        sleep "$debounce"
-        # Resumed work during the window? Not a real settle — keep waiting.
-        if is_working; then continue; fi
-        # Once we have witnessed real work, insist the agent still reads as
-        # settled now (guards against a transient/transition read).
-        if [ "$witnessed" -eq 1 ] && ! is_settled; then continue; fi
-        break
-      done
-
-      # distinguish a blocked settle from a clean one (no polling; single probes)
-      if herdr agent wait "$id" --until blocked --timeout 500 >/dev/null 2>&1; then
-        status="blocked"
-      else
-        status="awaiting-dispatch"
-      fi
-      # 1. DURABLE record — append-only, survives any wake failure; makes
-      #    bin/task-worktree list accurate without live polling.
-      printf "%s\n" "{\"event\":\"settled\",\"id\":\"$id\",\"status\":\"$status\",\"ts\":\"$(ts)\"}" >> "$ledger"
-      # 2. notify the human (covers the window if every wake retry fails)
-      herdr notification show "Task $id settled ($status)" \
-        --body "Recorded to ledger — Dispatch will report." >/dev/null 2>&1 || true
-      # 3. wake Dispatch, retrying so a transient busy/blocked state can'"'"'t
-      #    silently swallow the wake.
-      if [ -n "$disp" ]; then
-        msg="[task-watcher] Executor $id settled ($status). Run bin/task-worktree list, inspect it (herdr agent read $id), reconcile the ledger, push the branch, then flip it to awaiting-review and surface the result to the human."
-        for attempt in 1 2 3 4 5; do
-          herdr agent prompt "$disp" "$msg" >/dev/null 2>&1 && break
-          sleep 10
+        # Phase 2 — wait for a settle that HOLDS across the debounce window.
+        while :; do
+          herdr agent wait "$id" --until idle done blocked >/dev/null 2>&1 || true
+          sleep "$debounce"
+          # Resumed work during the window? Not a real settle — keep waiting.
+          if is_working; then continue; fi
+          # Once we have witnessed real work, insist the agent still reads as
+          # settled now (guards against a transient/transition read).
+          if [ "$witnessed" -eq 1 ] && ! is_settled; then continue; fi
+          break
         done
-      fi
-    ' _ "$id" "$dispatch_pane" "$LEDGER" >/dev/null 2>&1 &
+
+        # distinguish a blocked settle from a clean one (no polling; single probes)
+        if herdr agent wait "$id" --until blocked --timeout 500 >/dev/null 2>&1; then
+          status="blocked"
+        else
+          status="awaiting-dispatch"
+        fi
+        # 1. DURABLE record — append-only, survives any wake failure; makes
+        #    bin/task-worktree list accurate without live polling.
+        printf "%s\n" "{\"event\":\"settled\",\"id\":\"$id\",\"status\":\"$status\",\"ts\":\"$(ts)\"}" >> "$ledger"
+        # 2. notify the human (covers the window if every wake retry fails)
+        herdr notification show "Task $id settled ($status)" \
+          --body "Recorded to ledger — Dispatch will report." >/dev/null 2>&1 || true
+        # 3. wake Dispatch, retrying so a transient busy/blocked state can'"'"'t
+        #    silently swallow the wake.
+        if [ -n "$disp" ]; then
+          msg="[task-watcher] Executor $id settled ($status). Run bin/task-worktree list, inspect it (herdr agent read $id), reconcile the ledger, push the branch, then flip it to awaiting-review and surface the result to the human."
+          [ -n "$compare" ] && msg="$msg Show the human this GitHub compare link: $compare"
+          for attempt in 1 2 3 4 5; do
+            herdr agent prompt "$disp" "$msg" >/dev/null 2>&1 && break
+            sleep 10
+          done
+        fi
+
+        # RE-ARM: block until the executor genuinely resumes work, then loop to
+        # watch for the next settle. witnessed stays 1 (guards remain active).
+        until is_working; do
+          herdr agent wait "$id" --until working >/dev/null 2>&1 || true
+          sleep "$debounce"
+        done
+      done
+    ' _ "$id" "$dispatch_pane" "$LEDGER" "$watch_compare" >/dev/null 2>&1 &
     disown 2>/dev/null || true
-    info "watcher armed → record settle + notify + wake Dispatch (${dispatch_pane:-unknown}) when $id settles"
+    info "watcher armed → record + notify + wake Dispatch (${dispatch_pane:-unknown}) on EVERY settle of $id"
   fi
 
   # ledger entry
@@ -456,7 +496,15 @@ cmd_report() {
   local rec; rec="$(_find_created_rec "$id")"
   [ -n "$rec" ] || die "report: no ledger record for task '$id'"
   local mode; mode="$(jget "$rec" "d.get('mode') or 'code'")"
+  local rep_branch; rep_branch="$(jget "$rec" "d.get('branch') or ''")"
+  local rep_primary; rep_primary="$(jget "$rec" "d.get('primary_repo') or ''")"
   [ -n "$status" ] || status="awaiting-review"
+
+  # Compare link (code tasks): main...branch on the primary repo.
+  local compare=""
+  if [ "$mode" = "code" ] && [ -n "$rep_branch" ] && [ -n "$rep_primary" ]; then
+    compare="$(_compare_url "$rep_primary" "$rep_branch")"
+  fi
 
   if [ -n "$body_file" ]; then
     [ -f "$body_file" ] || die "report: --body-file not found: $body_file"
@@ -471,6 +519,7 @@ cmd_report() {
     printf '%s\n' "- **status:** $status"
     printf '%s\n' "- **mode:** $mode"
     [ -n "$commit" ] && printf '%s\n' "- **commit:** $commit"
+    [ -n "$compare" ] && printf '%s\n' "- **compare:** $compare"
     printf '%s\n\n' "- **ts:** $(now)"
     [ -n "$note" ] && printf '%s\n\n' "**note:** $note"
     printf '%s\n\n' '---'
@@ -498,6 +547,7 @@ PY
     _teardown_from_rec "$rec" 1 "$id"
   else
     info "mode=code → task $id left open at '$status' for review"
+    [ -n "$compare" ] && info "compare: $compare"
   fi
 }
 
