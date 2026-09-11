@@ -8,7 +8,10 @@
 #     silently turned every settle probe into "false" and made the watcher spin
 #     forever without recording anything, and
 #   * the boot transient, where a freshly-booted agent reads idle/done BEFORE it
-#     starts working and can trigger a FALSE settle.
+#     starts working and can trigger a FALSE settle, and
+#   * the HUMAN-INTERRUPT false settle: the human stopping an executor (pi
+#     /stop / Esc) also makes herdr report 'idle', which used to wake Dispatch
+#     with a half-finished task.
 # plus the exactly-once + re-arming guarantees of the settle claim.
 #
 # Usage: bin/task-worktree-selftest [-v]
@@ -17,7 +20,12 @@
 #   agent wait  --until <ONE status>, REPEAT for more; a second bare word is
 #               "unknown option: <word>" with exit code 2.
 #               rc 0 matched | rc 1 timeout/not-found | rc 2 bad invocation.
-#   agent get   prints agent_status + state_change_seq, rc 1 when not found.
+#   agent get   prints agent_status + state_change_seq + cwd + agent kind,
+#               rc 1 when not found.
+#
+# The settle CLASSIFIER is exercised against fixture pi session logs whose
+# stopReason/errorMessage pairs are copied verbatim from real recorded pi
+# sessions (see the table in task-worktree).
 set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task-worktree"
@@ -52,7 +60,8 @@ agent)
   get)
     st="$(read_state "${1:-}")" || { echo '{"error":{"code":"agent_not_found"}}'; exit 1; }
     set -- $st
-    printf '{"id":"cli:agent:get","result":{"agent":{"agent":"pi","agent_status":"%s","state_change_seq":%s,"name":"x","pane_id":"p1","cwd":"/x"}}}\n' "$1" "$2"
+    printf '{"id":"cli:agent:get","result":{"agent":{"agent":"%s","agent_status":"%s","state_change_seq":%s,"name":"x","pane_id":"p1","cwd":"%s"}}}\n' \
+      "${HERDR_STUB_AGENT:-pi}" "$1" "$2" "${HERDR_STUB_CWD:-/x}"
     ;;
   list)
     printf '{"result":{"agents":['; sep=""
@@ -111,6 +120,9 @@ export HERDR_STUB_STATE="$TMPROOT/state"
 export HERDR_STUB_LOG="$TMPROOT/herdr.log"
 export TASK_WATCH_DEBOUNCE=1
 export HERDR_STUB_MAXWAIT_MS=4000
+# keep the watcher's bounded re-probe waits short so the suite stays quick
+export TASK_WATCH_PROBE_TIMEOUT_MS=3000
+export TASK_WATCH_RESUME_TIMEOUT_MS=3000
 
 AID="demo-task-abc"
 
@@ -126,10 +138,50 @@ setup() {
   rm -f "$HERDR_STUB_STATE"/* "$HERDR_STUB_LOG"
   : > "$HERDR_STUB_LOG"
   mkdir -p "$SANDBOX/.dispatch"
+  # the fake agent's cwd + its own private pi session store
+  export HERDR_STUB_CWD="$SANDBOX/tasks/$AID"
+  export HERDR_STUB_AGENT=pi
+  export TASK_PI_SESSIONS_DIR="$SANDBOX/pi-sessions"
   printf '%s\n' "{\"event\":\"created\",\"id\":\"$AID\",\"slug\":\"demo\",\"branch\":\"demo\",\"primary_repo\":\"none\",\"mode\":\"code\",\"dispatch_pane\":\"wDISPATCH:p1\",\"status\":\"working\",\"ts\":\"x\"}" \
     > "$SANDBOX/.dispatch/ledger.jsonl"
 }
 TW() { "$SANDBOX/bin/task-worktree" "$@"; }
+
+# ---------------------------------------------------------------------------
+# fixture pi session logs (what the classifier reads instead of the terminal)
+#
+# stopReason/errorMessage pairs are taken VERBATIM from real pi sessions:
+#   human       a /stop that landed inside pi          (retryAttempt == 0)
+#   human-http  a /stop that landed in the HTTP call   (provider SDK abort)
+#   completed   a turn that finished normally
+#   crash       a provider failure
+#   retry-crash an abort raised while retrying a provider failure (NOT human)
+#   mid-tool    the session just stops mid tool-loop (executor died)
+# ---------------------------------------------------------------------------
+pi_session() {
+  local kind="$1" eid="${2:-e2}" dir sr em ts
+  dir="$TASK_PI_SESSIONS_DIR/-$(printf '%s' "$HERDR_STUB_CWD" | tr '/' '-')--"
+  mkdir -p "$dir"
+  case "$kind" in
+    completed)   sr=stop;    em="" ;;
+    human)       sr=aborted; em="Operation aborted" ;;
+    human-http)  sr=error;   em="This operation was aborted" ;;
+    crash)       sr=error;   em="Connection error." ;;
+    retry-crash) sr=aborted; em="Aborted after 1 retry attempt" ;;
+    mid-tool)    sr=toolUse; em="" ;;
+    *) echo "pi_session: unknown kind '$kind'" >&2; return 1 ;;
+  esac
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  {
+    printf '{"type":"session","version":3,"id":"s","cwd":"%s","timestamp":"%s"}\n' "$HERDR_STUB_CWD" "$ts"
+    printf '{"type":"message","id":"e1","parentId":null,"timestamp":"%s","message":{"role":"user","content":"go","timestamp":1}}\n' "$ts"
+    printf '{"type":"message","id":"%s","parentId":"e1","timestamp":"%s","message":{"role":"assistant","content":[],"stopReason":"%s","errorMessage":"%s","timestamp":2}}\n' \
+      "$eid" "$ts" "$sr" "$em"
+  } > "$dir/session.jsonl"
+}
+no_pi_session() { rm -rf "$TASK_PI_SESSIONS_DIR"; }
+cause() { TW classify "$AID" | cut -f1; }
+pauses() { grep -c '"event": *"paused"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
 # Kill any watcher left over from a previous case. The pattern is scoped to this
 # test run's temp dir, so it can never touch a real watcher.
 stop_watchers() { pkill -f "$TMPROOT.*watch" >/dev/null 2>&1; sleep 0.5; return 0; }
@@ -286,19 +338,20 @@ is "second settle reported too (re-armed)" "$second" "2"
 is "Dispatch woken exactly twice, once per settle" "$(wakes)" "2"
 
 # ===========================================================================
-printf '\n\033[1m9. watcher FAILS LOUD instead of spinning\033[0m\n'
+printf '\n\033[1m9. watcher FAILS LOUD instead of spinning (dead executor)\033[0m\n'
 # ===========================================================================
 setup; seq_state "$AID" working 90
 ( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
 sleep 2
 rm -f "$HERDR_STUB_STATE/$AID"                 # the agent vanishes: herdr errors
-sleep 8
+sleep 10
 alive=0; kill -0 "$WPID" 2>/dev/null && alive=1
 kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
 is "watcher exits instead of looping on a herdr failure" "$alive" "0"
-if grep -q 'watcher-failed' "$SANDBOX/.dispatch/ledger.jsonl"; then
+if grep -qE 'watcher-failed|"status": *"orphaned"' "$SANDBOX/.dispatch/ledger.jsonl"; then
   ok "the failure is recorded durably in the ledger"
 else bad "the failure is recorded durably in the ledger" "$(ledger | tail -2)"; fi
+is "and Dispatch is woken about it (a dead executor is real news)" "$(wakes)" "1"
 if grep -q 'ABORT' "$SANDBOX/.dispatch/logs/watch-$AID.log" 2>/dev/null; then
   ok "and logged to .dispatch/logs/watch-<id>.log"
 else bad "and logged to .dispatch/logs/watch-<id>.log"; fi
@@ -335,6 +388,170 @@ if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then ok "--body-file is persisted
 else bad "--body-file is persisted to reports/<id>.executor.md"; fi
 if grep -q 'https://x/pr/1' "$HERDR_STUB_LOG"; then ok "the PR url reaches the Dispatch wake"
 else bad "the PR url reaches the Dispatch wake" "$(cat "$HERDR_STUB_LOG")"; fi
+
+# ===========================================================================
+printf '\n\033[1m12. settle CLASSIFIER: why did the agent go idle?\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" idle 120
+pi_session completed;   is "stopReason=stop                        -> completed"       "$(cause)" "completed"
+pi_session human;       is "'Operation aborted' (pi /stop)          -> human-interrupt" "$(cause)" "human-interrupt"
+pi_session human-http;  is "'This operation was aborted' (/stop)    -> human-interrupt" "$(cause)" "human-interrupt"
+pi_session crash;       is "'Connection error.'                     -> agent-error"     "$(cause)" "agent-error"
+pi_session retry-crash; is "'Aborted after 1 retry attempt'         -> agent-error"     "$(cause)" "agent-error"
+pi_session mid-tool;    is "session ends mid tool-loop              -> unknown"         "$(cause)" "unknown"
+no_pi_session;          is "no session log at all                   -> unknown"         "$(cause)" "unknown"
+HERDR_STUB_AGENT=claude pi_session human
+is "a non-pi agent kind                     -> unknown" "$(HERDR_STUB_AGENT=claude cause)" "unknown"
+
+# ===========================================================================
+printf '\n\033[1m13. human interrupt is SUPPRESSED but never invisible\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" idle 130; pi_session human
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "no settle recorded for a human stop" "$(settles)" "0"
+is "Dispatch is NOT woken" "$(wakes)" "0"
+is "but a durable 'paused' event IS recorded" "$(pauses)" "1"
+if grep -q '"status": *"paused-by-human"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "with status paused-by-human"
+else bad "with status paused-by-human" "$(ledger | tail -1)"; fi
+if [ -z "$(grep '^NOTIFY' "$HERDR_STUB_LOG" 2>/dev/null)" ]; then
+  ok "and no desktop notification is fired"
+else bad "and no desktop notification is fired" "$(grep '^NOTIFY' "$HERDR_STUB_LOG")"; fi
+case "$(TW list 2>&1)" in *paused-by-human*) ok "'list' surfaces it on the next turn" ;;
+  *) bad "'list' surfaces it on the next turn" "$(TW list 2>&1)" ;; esac
+
+# the SAME interruption, probed again, must not spam the ledger
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "re-probing the same interruption adds nothing" "$(pauses)" "1"
+pi_session human e9                              # a NEW, distinct interruption
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "a distinct later interruption IS recorded" "$(pauses)" "2"
+
+# ===========================================================================
+printf '\n\033[1m14. suppression must not poison the exactly-once gate\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" idle 140; pi_session human
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "human stop suppressed" "$(settles)" "0"
+# the human steers, the executor works and finishes for real
+seq_state "$AID" working 141; pi_session completed; seq_state "$AID" idle 142
+TW done "$AID" --note "finished for real" >/dev/null 2>&1
+is "the executor's own 'done' still fires" "$(settles)" "1"
+is "and wakes Dispatch exactly once" "$(wakes)" "1"
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "the backstop is still de-duplicated against it" "$(settles)" "1"
+is "no double wake" "$(wakes)" "1"
+
+# ===========================================================================
+printf '\n\033[1m15. everything that is NOT positively human still wakes\033[0m\n'
+# ===========================================================================
+for kind in completed crash retry-crash mid-tool; do
+  setup; seq_state "$AID" idle 150; pi_session "$kind"
+  TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+  is "$kind settle wakes Dispatch" "$(wakes)" "1"
+done
+setup; seq_state "$AID" idle 151; no_pi_session
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "an unclassifiable settle wakes Dispatch (bias toward waking)" "$(wakes)" "1"
+
+setup; seq_state "$AID" idle 152; pi_session human
+TASK_SETTLE_CLASSIFY=0 TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "TASK_SETTLE_CLASSIFY=0 disables suppression entirely" "$(wakes)" "1"
+
+setup; seq_state "$AID" idle 153; pi_session human
+TW notify-settle "$AID" --by watcher --status watcher-failed --classify --force >/dev/null 2>&1
+is "a watcher-failure (--force) is never suppressed" "$(wakes)" "1"
+
+setup; seq_state "$AID" idle 154; pi_session human
+TW done "$AID" --note "executor self-report" >/dev/null 2>&1
+is "the executor's 'done' is never classified or suppressed" "$(settles)" "1"
+
+# ===========================================================================
+printf '\n\033[1m16. live watcher: stop -> steer -> finish reports exactly once\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 160; pi_session mid-tool
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 2
+pi_session human; seq_state "$AID" idle 161       # the HUMAN hits /stop
+sleep 6
+after_stop_settles="$(settles)"; after_stop_wakes="$(wakes)"; after_stop_pauses="$(pauses)"
+pi_session mid-tool; seq_state "$AID" working 162 # the human steers it
+sleep 4
+pi_session completed; seq_state "$AID" idle 163   # it finishes for real
+sleep 7
+final_settles="$(settles)"; final_wakes="$(wakes)"
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "human stop: nothing settled" "$after_stop_settles" "0"
+is "human stop: Dispatch NOT woken" "$after_stop_wakes" "0"
+is "human stop: recorded as paused-by-human" "$after_stop_pauses" "1"
+is "real finish: one settle" "$final_settles" "1"
+is "real finish: woken EXACTLY once (watcher stayed armed)" "$final_wakes" "1"
+note "$(ledger | tail -2)"
+
+# ===========================================================================
+printf '\n\033[1m17. live watcher: an agent-error settle still wakes\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 170; pi_session mid-tool
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 2
+pi_session crash; seq_state "$AID" idle 171
+sleep 7
+got_s="$(settles)"; got_w="$(wakes)"
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "a provider-error settle is recorded" "$got_s" "1"
+is "and Dispatch is woken (the human must hear about it)" "$got_w" "1"
+if grep -q '"cause": *"agent-error"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "the cause is recorded on the settle event"
+else bad "the cause is recorded on the settle event" "$(ledger | tail -1)"; fi
+
+# ===========================================================================
+printf '\n\033[1m18. boot transient + human stop must not resurrect each other\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" idle 180; pi_session human   # freshly booted AND idle
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 3
+boot="$(settles)"
+seq_state "$AID" working 181; pi_session mid-tool; sleep 3
+pi_session completed; seq_state "$AID" idle 182; sleep 7
+final="$(settles)"
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "no false settle during the boot transient" "$boot" "0"
+is "the real finish still reports" "$final" "1"
+is "and wakes exactly once" "$(wakes)" "1"
+
+# ===========================================================================
+printf '\n\033[1m19. reconcile understands paused-by-human\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" idle 190; pi_session human
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+TW reconcile >/dev/null 2>&1
+is "reconcile does not wake for a task the human paused" "$(wakes)" "0"
+is "and does not invent a settle" "$(settles)" "0"
+is "nor duplicate the pause record" "$(pauses)" "1"
+pi_session completed                                   # it later finishes
+TW reconcile >/dev/null 2>&1
+is "once it really finishes, reconcile repairs + wakes" "$(settles)" "1"
+is "waking Dispatch once" "$(wakes)" "1"
+
+# ===========================================================================
+printf '\n\033[1m20. re-arm cannot deadlock on a turn it never saw\033[0m\n'
+# ===========================================================================
+# A steered turn can start AND finish inside the watcher blind spot. The old
+# re-arm loop waited forever for a 'working' it had already missed, so the next
+# genuine settle was never reported. The session log moving on is the way out.
+setup; seq_state "$AID" working 200; pi_session mid-tool
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 2
+pi_session completed e5; seq_state "$AID" idle 201        # first settle
+sleep 7
+first="$(settles)"
+# steered + finished entirely between probes: status never reads 'working'
+pi_session completed e6; seq_state "$AID" idle 202
+sleep 14
+second="$(settles)"
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "first settle reported" "$first" "1"
+is "the missed turn's settle is reported too (no deadlock)" "$second" "2"
 
 printf '\n\033[1m%d passed, %d failed\033[0m\n\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

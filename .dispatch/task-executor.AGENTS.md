@@ -20,6 +20,10 @@ primary completion path, and it is a hard requirement of this contract:
 - It records the durable ledger event, notifies the human, and wakes Dispatch —
   **exactly once**. A background watcher is only a backstop for the case where
   you die before calling it; the two never double-report.
+- **Only `done` is trusted to mean "finished".** Going idle is not a report: if
+  the human stops you mid-turn (pi `/stop`), the watcher now classifies that as
+  a human interruption, records `paused-by-human` and deliberately does **not**
+  wake Dispatch. Nobody will hear about your work until you call `done`.
 - **Never run `herdr agent prompt` (or any other `herdr` command) by hand.**
   `task-worktree` is the only sanctioned way to reach Dispatch.
 - Stopping blocked instead of finished? Same command with `--blocked`.

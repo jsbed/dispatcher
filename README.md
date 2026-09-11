@@ -26,6 +26,7 @@ bin/task-worktree done       # (executors) "I am finished" — wakes Dispatch
 bin/task-worktree report     # persist an executor's report; auto-close if investigative
 bin/task-worktree list       # task status from the ledger
 bin/task-worktree reconcile  # repair ledger status from live herdr state
+bin/task-worktree classify   # why is an executor idle? (stopped by you / done / crashed)
 bin/task-worktree remove     # close a task and clean up (keeps the branch)
 bin/task-worktree prune      # reconcile dangling symlinks
 ```
@@ -73,13 +74,40 @@ claim* before recording anything, so **Dispatch is woken exactly once per
 settle** — and the claim is released when the executor resumes work, so a task
 that settles, gets steered, and settles again reports every time.
 
+### "Did it finish, or did *you* stop it?"
+
+herdr can only see that an agent went **idle** — and stopping an executor
+yourself (pi's `/stop`, Esc) looks exactly like it finishing. That used to wake
+Dispatch with a half-done task and a compare link.
+
+So before the backstop wakes anyone it **classifies** the settle by reading pi's
+own session log, where the reason is recorded structurally:
+
+| pi `stopReason` / `errorMessage` | cause | wake? |
+|---|---|---|
+| `stop` | `completed` | ✅ |
+| `aborted` / `Operation aborted` | `human-interrupt` | 🚫 suppressed |
+| `error` / `This operation was aborted` | `human-interrupt` | 🚫 suppressed |
+| `aborted` / `Aborted after N retry attempt` | `agent-error` | ✅ flagged |
+| `error` / `Connection error.`, `terminated`, … | `agent-error` | ✅ flagged |
+| anything else / no session log | `unknown` | ✅ (bias toward waking) |
+
+A suppressed settle is **not invisible**: it lands in the ledger as
+`paused-by-human`, so `list` and `reconcile` show it on your next turn. The
+watcher stays armed, so the next genuine settle reports normally, and the
+executor's own `done` is never classified or suppressed. `TASK_SETTLE_CLASSIFY=0`
+turns the whole thing off (always wake).
+
 If a watcher ever breaks it fails **loud**: it logs to
 `.dispatch/logs/watch-<id>.log`, records a `watcher-failed` settle and wakes
-Dispatch, rather than spinning silently. `bin/task-worktree reconcile` repairs
+Dispatch, rather than spinning silently. An executor that *dies* (crash, or its
+workspace closed) is reported the same way, as an `orphaned` settle — silence is
+never an acceptable answer. `bin/task-worktree reconcile` repairs
 any task whose ledger status drifted from live herdr state.
 
 `bin/task-worktree-selftest` exercises all of this against a scripted fake herdr
-(exactly-once, re-arming, the boot-transient guard, and the fail-loud paths).
+(exactly-once, re-arming, the boot-transient guard, the settle classifier and
+the fail-loud paths).
 
 ## What's tracked here
 

@@ -13,6 +13,7 @@
 #   done      Executor self-notification: "I am finished" (PRIMARY completion path).
 #   watch     Detached settle watcher for one task (BACKSTOP; armed by create).
 #   report    Persist an executor's report durably.
+#   classify  Say WHY an executor settled (human /stop vs finished vs crashed).
 #   reconcile Repair ledger status from live herdr agent state.
 #   remove    Tear down a task: herdr worktrees, symlinks, task dir, ledger.
 #   prune     Garbage-collect dangling worktree symlinks + unused repo symlinks.
@@ -27,6 +28,25 @@
 # Whoever gets there first claims the settle; the other is suppressed. The claim
 # is released when the executor genuinely resumes work (re-arming), so a task
 # that settles -> is steered -> settles again reports every time.
+#
+# SETTLE CLASSIFICATION (why an agent went idle)
+# herdr only reports THAT an agent is idle, never WHY. A human hitting pi's
+# stop/interrupt (Esc, `app.interrupt`) also produces 'idle', which used to make
+# the BACKSTOP wake Dispatch with a half-finished task. pi records the reason
+# structurally in its own session JSONL, so we read it there rather than
+# scraping the terminal (see `classify`):
+#   stopReason=stop                                   -> completed        WAKE
+#   stopReason=aborted   errorMessage=Operation aborted -> human-interrupt SUPPRESS
+#   stopReason=error     errorMessage=...was aborted    -> human-interrupt SUPPRESS
+#   stopReason=aborted   errorMessage=Aborted after N retry... -> agent-error WAKE
+#   stopReason=error     (Connection error./terminated/...)     -> agent-error WAKE
+#   anything else                                     -> unknown         WAKE
+# Only the BACKSTOP (`watch`) and `reconcile` classify. The executor's own
+# `done` is ALWAYS trusted and never classified or suppressed. Ambiguity always
+# resolves to waking: losing a real completion is far worse than one noisy wake.
+# A suppressed settle is still recorded ('paused' event, status
+# 'paused-by-human') so `list`/`reconcile` surface it, and it deliberately never
+# touches the settle claim, so the exactly-once gate cannot be poisoned.
 #
 set -euo pipefail
 
@@ -178,6 +198,185 @@ PY
 _agent_status() { _agent_field "$1" agent_status 2>/dev/null || true; }
 # _agent_seq <target> -> herdr's monotonic state_change_seq ("" if gone)
 _agent_seq()    { _agent_field "$1" state_change_seq 2>/dev/null || true; }
+# _agent_cwd <target> -> the agent's working directory ("" if gone)
+_agent_cwd()    { _agent_field "$1" cwd 2>/dev/null || true; }
+# _agent_kind <target> -> the detected agent kind, e.g. 'pi' ("" if gone)
+_agent_kind()   { _agent_field "$1" agent 2>/dev/null || true; }
+
+# ---------------------------------------------------------------------------
+# Settle classification — WHY did the agent go idle?
+#
+# herdr's agent_status is screen-scraped and only ever says idle/working/
+# blocked; it cannot tell "the executor finished" from "the human hit stop".
+# pi, however, writes a structured session JSONL (\$PI_SESSION_FILE, under
+# ~/.pi/agent/sessions/--<cwd with / as ->--/) in which every assistant turn
+# carries a stopReason, and a human interrupt is recorded distinguishably.
+# Verified against live sessions (2026-09-11):
+#   human /stop (Esc / app.interrupt):
+#       {"stopReason":"aborted","errorMessage":"Operation aborted"}       (abort
+#         landed inside pi: interactive-mode sets this when retryAttempt == 0)
+#       {"stopReason":"error","errorMessage":"This operation was aborted"} (abort
+#         landed inside the in-flight provider HTTP request)
+#   provider/agent failure (the human must still hear about it):
+#       {"stopReason":"error","errorMessage":"Connection error."|"terminated"
+#                                            |"Request timed out."}
+#       {"stopReason":"aborted","errorMessage":"Aborted after 1 retry attempt"}
+#         (retryAttempt > 0 -> NOT a human stop, despite saying 'aborted')
+#   natural completion:
+#       {"stopReason":"stop"}
+# Everything unrecognised is 'unknown', which WAKES. Terminal scraping for
+# strings like "Command aborted" is deliberately NOT used: it is lossy,
+# version-dependent and invisible once the screen scrolls.
+# ---------------------------------------------------------------------------
+
+PI_SESSIONS_DIR="${TASK_PI_SESSIONS_DIR:-$HOME/.pi/agent/sessions}"
+
+# _classify_session <cwd> [explicit-session-file]
+#   prints "<cause>\t<detail>\t<marker>"
+#   cause: human-interrupt | completed | agent-error | unknown
+#   marker: a stable id for the settle-causing entry (used to de-duplicate
+#           repeated 'paused' ledger records for the SAME interruption).
+_classify_session() {
+  python3 - "${1:-}" "$PI_SESSIONS_DIR" "${2:-}" <<'PY'
+import glob, json, os, sys
+
+cwd, sessions_root, explicit = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def out(cause, detail, marker=""):
+    print("%s\t%s\t%s" % (cause, detail.replace("\t", " "), marker))
+    raise SystemExit(0)
+
+def newest(paths):
+    paths = [p for p in paths if os.path.isfile(p)]
+    return max(paths, key=os.path.getmtime) if paths else ""
+
+def session_file():
+    if explicit:
+        return explicit if os.path.isfile(explicit) else ""
+    if not cwd:
+        return ""
+    # pi's own naming: '--' + cwd with '/' -> '-' + '--'  (leading / already -)
+    direct = os.path.join(sessions_root, "-" + cwd.replace("/", "-") + "--")
+    hit = newest(glob.glob(os.path.join(direct, "*.jsonl")))
+    if hit:
+        return hit
+    # Fallback: match the header cwd across the most recent session files.
+    cands = sorted(glob.glob(os.path.join(sessions_root, "*", "*.jsonl")),
+                   key=os.path.getmtime, reverse=True)[:60]
+    for f in cands:
+        try:
+            with open(f) as fh:
+                head = json.loads(fh.readline())
+        except Exception:
+            continue
+        if head.get("cwd") == cwd:
+            return f
+    return ""
+
+f = session_file()
+if not f:
+    out("unknown", "no pi session log found for cwd %r" % (cwd or "?"))
+
+last = None
+with open(f) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        m = o.get("message") or {}
+        if m.get("role") == "assistant":
+            last = (o, m)
+
+base = os.path.basename(f)
+if last is None:
+    out("unknown", "no assistant turn in session %s" % base)
+
+o, m = last
+sr = (m.get("stopReason") or "").strip()
+em = (m.get("errorMessage") or "").strip()
+marker = "%s#%s" % (base, o.get("id") or o.get("timestamp") or "")
+key = em.lower().rstrip(".").strip()
+
+# Exact phrases pi emits for a USER-initiated abort. Kept as an exact set (not a
+# loose /abort/ match) precisely because provider failures also say "Aborted".
+HUMAN = {
+    "operation aborted",
+    "this operation was aborted",
+    "the operation was aborted",
+    "operation was aborted",
+    "request was aborted",
+    "aborted by user",
+}
+
+if sr in ("aborted", "error") and key in HUMAN:
+    out("human-interrupt",
+        "pi turn ended stopReason=%s errorMessage=%r (user stop/interrupt) in %s"
+        % (sr, em, base), marker)
+if sr == "aborted" and "retry" in key:
+    out("agent-error", "pi aborted during provider retry: %s" % (em or "?"), marker)
+if sr == "aborted":
+    out("unknown", "pi turn aborted with unrecognised errorMessage %r" % em, marker)
+if sr == "error":
+    out("agent-error", "pi turn failed: %s" % (em or "unknown error"), marker)
+if sr == "stop":
+    out("completed", "pi finished its turn normally (stopReason=stop)", marker)
+if sr == "toolUse":
+    out("unknown", "session ends mid tool-loop (stopReason=toolUse) — executor may have died", marker)
+out("unknown", "unrecognised stopReason %r" % sr, marker)
+PY
+}
+
+# _classify_settle <id> [session-file] -> "<cause>\t<detail>\t<marker>"
+# Never fails: any problem resolves to 'unknown', which means WAKE.
+_classify_settle() {
+  local id="$1" sess="${2:-}" kind="" cwd="" res=""
+  if [ -z "$sess" ]; then
+    kind="$(_agent_kind "$id")"
+    [ -n "$kind" ] || kind="$(_task_field "$id" agent_kind)"
+    if [ -n "$kind" ] && [ "$kind" != "pi" ]; then
+      printf 'unknown\tagent kind %s keeps no session log we can classify\t\n' "$kind"
+      return 0
+    fi
+    cwd="$(_agent_cwd "$id")"
+    [ -n "$cwd" ] || cwd="$TASKS_DIR/$id"
+  fi
+  res="$(_classify_session "$cwd" "$sess" 2>/dev/null || true)"
+  [ -n "$res" ] || res="$(printf 'unknown\tclassifier failed to run\t')"
+  printf '%s\n' "$res"
+}
+
+usage_classify() {
+  cat >&2 <<EOF
+Usage: task-worktree classify <task-id> [--session <pi-session.jsonl>]
+
+  Says WHY an executor settled, by reading pi's own session log rather than
+  scraping the terminal. Prints: <cause>\t<detail>\t<marker>
+
+    human-interrupt  the HUMAN stopped it (pi /stop, Esc, app.interrupt)
+                     -> the backstop watcher SUPPRESSES the wake
+    completed        the executor finished its turn (stopReason=stop)
+    agent-error      provider/agent failure (connection error, retry abort)
+    unknown          not determinable — treated as a genuine settle (wakes)
+EOF
+}
+
+cmd_classify() {
+  local id="" sess=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) sess="$2"; shift 2 ;;
+      -h|--help) usage_classify; return 0 ;;
+      -*) die "classify: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "classify: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_classify; die "classify: task id required"; }
+  _classify_settle "$id" "$sess"
+}
 
 # _discover_dispatch_pane -> pane id of the Dispatch agent (cwd == the root)
 _discover_dispatch_pane() {
@@ -333,6 +532,48 @@ PY
   ledger_append "{\"event\":\"resumed\",\"id\":\"$id\",\"status\":\"working\",\"reason\":\"$reason\",\"ts\":\"$(now)\"}"
 }
 
+# _record_pause <id> <by> <detail> <marker> — durably record a SUPPRESSED settle.
+#
+# Suppressed is NOT invisible: the human interruption goes into the ledger as a
+# 'paused' event with status 'paused-by-human', so `list` shows it and
+# `reconcile` can re-examine it later. Deliberately does NOT touch the settle
+# claim, so the exactly-once gate shared with `done` cannot be poisoned.
+# De-duplicated on <marker> so a re-probing watcher/reconcile cannot spam the
+# ledger with one interruption.
+_record_pause() {
+  local id="$1" by="$2" detail="$3" marker="$4"
+  python3 - "$LEDGER" "$id" "$by" "$detail" "$marker" "$(now)" <<'PY'
+import json, sys
+ledger, id_, by, detail, marker, ts = sys.argv[1:7]
+
+last = None
+try:
+    for line in open(ledger):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("id") == id_:
+            last = o
+except OSError:
+    pass
+
+# already recorded THIS interruption -> nothing new to say
+if last and last.get("event") == "paused" and marker and last.get("marker") == marker:
+    raise SystemExit(0)
+
+with open(ledger, "a") as fh:
+    fh.write(json.dumps({
+        "event": "paused", "id": id_, "status": "paused-by-human",
+        "by": by, "cause": "human-interrupt", "suppressed": True,
+        "detail": detail or None, "marker": marker or None, "ts": ts,
+    }) + "\n")
+PY
+}
+
 # _settle_forget <id> — drop all claim state (teardown).
 _settle_forget() {
   rm -f  "$SETTLE_DIR/$1.claim" 2>/dev/null || true
@@ -350,18 +591,27 @@ Usage: task-worktree notify-settle <task-id> --by <executor|watcher|reconcile>
                             [--note <text>] [--pr <url>] [--commit <sha>]
                             [--body <text> | --body-file <path>]
                             [--dispatch-pane <pane>] [--compare <url>] [--force]
+                            [--classify]
 
   Internal plumbing: takes the settle claim, appends the durable 'settled'
   ledger event, fires the desktop notification and wakes Dispatch — EXACTLY
   ONCE per settle. Prefer 'done' (executors) over calling this directly.
+
+  --classify  Ask 'classify' WHY the agent settled first, and SUPPRESS the wake
+              + notification on positive evidence that the HUMAN stopped it
+              (recording a durable 'paused' event instead). Used by the backstop
+              watcher and reconcile; never by the executor's own 'done'.
+              Set TASK_SETTLE_CLASSIFY=0 to disable (always wake).
 EOF
 }
 
 cmd_notify_settle() {
   local id="" by="" status="awaiting-dispatch" note="" pr="" commit=""
-  local body="" body_file="" pane_arg="" compare="" force=0 quiet=0
+  local body="" body_file="" pane_arg="" compare="" force=0 quiet=0 classify=0
+  local cause=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --classify)      classify=1; shift ;;
       --by)            by="$2"; shift 2 ;;
       --status)        status="$2"; shift 2 ;;
       --note)          note="$2"; shift 2 ;;
@@ -381,7 +631,28 @@ cmd_notify_settle() {
   [ -n "$id" ] || { usage_notify_settle; die "notify-settle: task id required"; }
   [ -n "$by" ] || die "notify-settle: --by required"
 
-  # 0. EXACTLY-ONCE GATE.
+  # 0a. WHY did it settle? Only for non-executor paths: the executor's own
+  #     'done' is always trusted. Runs BEFORE the claim so a suppression can
+  #     never consume/poison the exactly-once gate.
+  if [ "$classify" -eq 1 ] && [ "${TASK_SETTLE_CLASSIFY:-1}" != "0" ] && [ "$force" -eq 0 ]; then
+    local cls detail marker
+    cls="$(_classify_settle "$id")"
+    cause="$(printf '%s' "$cls" | cut -f1)"
+    detail="$(printf '%s' "$cls" | cut -f2)"
+    marker="$(printf '%s' "$cls" | cut -f3)"
+    if [ "$cause" = "human-interrupt" ]; then
+      # POSITIVE evidence the human stopped it: record, do not wake, do not
+      # notify, do not claim. The watcher stays armed; the next genuine settle
+      # reports normally.
+      _record_pause "$id" "$by" "$detail" "$marker"
+      [ "$quiet" -eq 1 ] || \
+        info "settle for $id classified as human-interrupt — wake suppressed ($detail)"
+      return 0
+    fi
+    [ "$quiet" -eq 1 ] || info "settle for $id classified as '${cause:-unknown}' — waking ($detail)"
+  fi
+
+  # 0b. EXACTLY-ONCE GATE.
   if ! _settle_claim "$id" "$by" "$force"; then
     [ "$quiet" -eq 1 ] || info "settle already reported for $id (epoch ${SETTLE_EPOCH:-?}) — $by suppressed"
     return 0
@@ -421,12 +692,13 @@ cmd_notify_settle() {
   #    `list` accurate with no live polling.
   local entry
   entry="$(python3 - "$id" "$status" "$by" "$epoch" "$note" "$pr" "$commit" \
-                    "${exec_report:+reports/$id.executor.md}" "$compare" "$(now)" <<'PY'
+                    "${exec_report:+reports/$id.executor.md}" "$compare" "$(now)" "$cause" <<'PY'
 import json, sys
-(id_, status, by, epoch, note, pr, commit, rf, compare, ts) = sys.argv[1:11]
+(id_, status, by, epoch, note, pr, commit, rf, compare, ts, cause) = sys.argv[1:12]
 print(json.dumps({
     "event": "settled", "id": id_, "status": status, "by": by,
     "epoch": int(epoch) if str(epoch).isdigit() else None,
+    "cause": cause or None,
     "note": note or None, "pr": pr or None, "commit": commit or None,
     "executor_report": rf or None, "compare": compare or None, "ts": ts,
 }))
@@ -450,6 +722,8 @@ PY
   else
     msg="[task-$by] Executor $id settled ($status)."
   fi
+  [ "$cause" = "agent-error" ] && \
+    msg="$msg WARNING: this settle looks like an AGENT/PROVIDER FAILURE, not a finished task — check the work before reporting it as done."
   [ -n "$note" ]        && msg="$msg Note: $note"
   [ -n "$pr" ]          && msg="$msg PR: $pr"
   [ -n "$compare" ]     && msg="$msg Show the human this GitHub compare link: $compare"
@@ -536,6 +810,11 @@ Usage: task-worktree watch <task-id> [--dispatch-pane <pane>] [--compare <url>]
   hands the settle to 'notify-settle', which de-duplicates against the
   executor's own 'done'. Re-arms after every settle. Normally started detached
   by 'create'; run it in the foreground to debug (logs to .dispatch/logs/).
+
+  Every settle it sees is CLASSIFIED first (see 'classify'): a settle caused by
+  the HUMAN stopping the executor is recorded as 'paused-by-human' and does NOT
+  wake Dispatch, while completions, blocks, agent errors and anything ambiguous
+  do. The watcher stays armed either way.
 EOF
 }
 
@@ -552,6 +831,34 @@ _watch_abort() {
     --note "watcher aborted: $reason (log: ${WATCH_LOG#$ROOT/}) — check this task's real state with bin/task-worktree reconcile" \
     >/dev/null 2>&1 || true
   exit 1
+}
+
+# _watch_gone <id> — the executor's agent vanished while the task was still open
+# (it crashed, or its workspace was closed). That is a REAL event the human must
+# hear about, so it always wakes — it is never classified or suppressed.
+_watch_gone() {
+  local id="$1"
+  _watch_log "ABORT: executor agent vanished while the task was still open — reporting orphaned"
+  herdr notification show "Executor $id DIED ($id)" \
+    --body "the agent is gone but the task is still open" >/dev/null 2>&1 || true
+  cmd_notify_settle "$id" --by watcher --status orphaned --force \
+    --note "the executor agent is GONE (crashed or its workspace was closed) while the task was still open — nothing was self-reported; inspect the branch, then handoff or close it" \
+    >/dev/null 2>&1 || true
+  exit 1
+}
+
+# _watch_rc2 <id> — the one place a fatal herdr probe (rc 2) is interpreted.
+# Never returns: the task was torn down (clean exit), the executor's agent is
+# gone (loud 'orphaned' wake), or herdr itself failed (loud 'watcher-failed').
+_watch_rc2() {
+  local id="$1"
+  if [ ! -d "$TASKS_DIR/$id" ]; then
+    _watch_log "task dir gone — task closed; watcher exiting cleanly"; exit 0
+  fi
+  case "$HWAIT_ERR" in
+    *"agent not found"*|*agent_not_found*) _watch_gone "$id" ;;
+  esac
+  _watch_abort "$id" "$HWAIT_ERR"
 }
 
 cmd_watch() {
@@ -581,6 +888,10 @@ cmd_watch() {
   # SAFETY VALVE: the maximum number of inconclusive probes before we give up
   # and fail loud. The old watcher could spin here forever, recording nothing.
   local max_spins="${TASK_WATCH_MAX_SPINS:-120}"
+  # How long each blocking herdr wait may run before we re-probe. Bounded on
+  # purpose: an unbounded wait never returns if the agent disappears mid-wait.
+  local probe_ms="${TASK_WATCH_PROBE_TIMEOUT_MS:-60000}"
+  local resume_ms="${TASK_WATCH_RESUME_TIMEOUT_MS:-30000}"
 
   _watch_log "watch start (pid $$, debounce=${debounce}s, max_spins=$max_spins, pane=${pane:-auto})"
 
@@ -594,7 +905,7 @@ cmd_watch() {
   local witnessed=0
   for n in 1 2 3 4 5 6; do
     rc=0; _hwait "$id" --until working --timeout 30000 || rc=$?
-    [ "$rc" -ge 2 ] && _watch_abort "$id" "$HWAIT_ERR"
+    [ "$rc" -ge 2 ] && _watch_rc2 "$id"
     if [ "$(_agent_status "$id")" = "working" ]; then witnessed=1; break; fi
     sleep "$debounce"
   done
@@ -606,23 +917,27 @@ cmd_watch() {
     # NOTE: a BARE wait already means idle|done|blocked. Never write
     # '--until idle done blocked' — herdr exits rc=2 on that.
     spins=0
+    local gone=0
     while :; do
-      rc=0; _hwait "$id" || rc=$?
-      if [ "$rc" -ge 2 ]; then
-        # The agent vanishing is normal iff the task was torn down.
-        if [ ! -d "$TASKS_DIR/$id" ]; then
-          _watch_log "task dir gone — task closed; watcher exiting cleanly"; return 0
-        fi
-        _watch_abort "$id" "$HWAIT_ERR"
-      fi
+      # BOUNDED: an unbounded `herdr agent wait` never returns if the agent
+      # disappears mid-wait, which used to leave the watcher hung forever on a
+      # crashed executor. Timing out and re-probing is what makes the
+      # crash/vanish path below reachable at all.
+      rc=0; _hwait "$id" --timeout "$probe_ms" || rc=$?
+      [ "$rc" -ge 2 ] && _watch_rc2 "$id"          # torn down / gone / broken
       sleep "$debounce"
       st="$(_agent_status "$id")"
       case "$st" in
         idle|done|blocked) break ;;                     # a real, held settle
-        working) : ;;                                   # resumed mid-window
+        working) gone=0 ;;                              # resumed mid-window
         "") if [ ! -d "$TASKS_DIR/$id" ]; then
               _watch_log "agent gone + task dir gone — exiting cleanly"; return 0
-            fi ;;
+            fi
+            # the task is still open but its agent is gone: confirm once, then
+            # report it LOUD rather than spinning for an hour.
+            gone=$((gone + 1))
+            [ "$gone" -ge 2 ] && _watch_gone "$id"
+            ;;
       esac
       spins=$((spins + 1))
       [ "$spins" -gt "$max_spins" ] && \
@@ -636,28 +951,47 @@ cmd_watch() {
 
     # Hand off to the shared path — it de-duplicates against the executor's
     # own 'done', so Dispatch is woken exactly once for this settle.
-    cmd_notify_settle "$id" --by watcher --status "$status" --quiet \
+    # Classify BEFORE waking: a human /stop also reads as 'idle', and waking
+    # Dispatch for that reports a half-finished task as if it were done.
+    local cls="" cause="" marker=""
+    cls="$(_classify_settle "$id")"
+    cause="$(printf '%s' "$cls" | cut -f1)"
+    marker="$(printf '%s' "$cls" | cut -f3)"
+    _watch_log "classified: $cls"
+
+    cmd_notify_settle "$id" --by watcher --status "$status" --quiet --classify \
       ${pane:+--dispatch-pane "$pane"} ${compare:+--compare "$compare"} \
       >>"$WATCH_LOG" 2>&1 || _watch_log "warning: notify-settle failed (see above)"
+    [ "$cause" = "human-interrupt" ] && \
+      _watch_log "wake SUPPRESSED (human interrupt); recorded as paused-by-human, staying armed"
 
-    # RE-ARM: block until the executor genuinely resumes work, then release the
+    # RE-ARM: park until the executor genuinely resumes work, then release the
     # settle claim so the NEXT settle reports again.
+    #
+    # Two ways out, because a short steered turn can start AND finish inside our
+    # blind spot (that used to deadlock the watcher here, waiting forever for a
+    # 'working' it had already missed):
+    #   (a) we observe the agent working, or
+    #   (b) pi's session log has moved past the settle we just handled, which
+    #       means a whole new turn came and went -> a new settle is pending.
     spins=0
     while :; do
       if [ "$(_agent_status "$id")" = "working" ]; then break; fi
-      rc=0; _hwait "$id" --until working || rc=$?
-      if [ "$rc" -ge 2 ]; then
-        if [ ! -d "$TASKS_DIR/$id" ]; then
-          _watch_log "task closed while parked; watcher exiting cleanly"; return 0
-        fi
-        _watch_abort "$id" "$HWAIT_ERR"
+      local now_marker
+      now_marker="$(_classify_settle "$id" | cut -f3)"
+      if [ -n "$marker" ] && [ -n "$now_marker" ] && [ "$now_marker" != "$marker" ]; then
+        _watch_log "re-arm: session advanced ($marker -> $now_marker) while parked; a new settle is pending"
+        break
       fi
-      sleep "$debounce"
+      # A bounded wait: rc 0 = resumed, rc 1 = still parked (re-check above).
+      rc=0; _hwait "$id" --until working --timeout "$resume_ms" || rc=$?
+      [ "$rc" -ge 2 ] && _watch_rc2 "$id"
+      [ "$rc" -eq 0 ] && break
       spins=$((spins + 1))
       # Nothing is pending here (the settle is already recorded), so we back off
       # instead of aborting — but we never hot-spin.
       if [ "$spins" -gt "$max_spins" ]; then
-        _watch_log "re-arm: no confirmed resume after $spins probes; backing off"
+        _watch_log "re-arm: no resume after $spins probes; backing off"
         sleep 30
       fi
     done
@@ -1279,9 +1613,12 @@ Usage: task-worktree reconcile [<task-id> ...] [--dry-run] [--no-wake]
   'working' in the ledger while its agent is actually idle. reconcile compares
   the two and repairs the ledger.
 
-  An idle/blocked agent whose task still reads 'working' is put through the
-  normal notify-settle path, so it is recorded and Dispatch is woken — still
-  exactly once, because it takes the same settle claim.
+  An idle/blocked agent whose task still reads 'working' (or 'paused-by-human')
+  is put through the normal notify-settle path, so it is recorded and Dispatch
+  is woken — still exactly once, because it takes the same settle claim. Like
+  the watcher, reconcile CLASSIFIES first: a task the human stopped and has not
+  resumed stays suppressed (and is re-stamped 'paused-by-human' only once), so
+  reconcile never turns a human pause into a false completion.
 
   --dry-run  Report what would change; touch nothing.
   --no-wake  Record the repair in the ledger but do not wake Dispatch.
@@ -1335,7 +1672,7 @@ PY
       working)
         printf '  %-34s ledger=%-16s live=working        ok\n' "$tid" "$ledger_status" ;;
       idle|done|blocked)
-        if [ "$ledger_status" = "working" ]; then
+        if [ "$ledger_status" = "working" ] || [ "$ledger_status" = "paused-by-human" ]; then
           local new="awaiting-dispatch"
           [ "$live" = "blocked" ] && new="blocked"
           printf '  %-34s ledger=%-16s live=%-12s REPAIR -> %s\n' \
@@ -1343,8 +1680,8 @@ PY
           if [ "$dry" -eq 0 ]; then
             changed=1
             if [ "$wake" -eq 1 ]; then
-              cmd_notify_settle "$tid" --by reconcile --status "$new" \
-                --note "reconciled: agent was '$live' while the ledger still said 'working' (a settle was missed)"
+              cmd_notify_settle "$tid" --by reconcile --status "$new" --classify \
+                --note "reconciled: agent was '$live' while the ledger still said '$ledger_status' (a settle was missed)"
             else
               ledger_append "{\"event\":\"settled\",\"id\":\"$tid\",\"status\":\"$new\",\"by\":\"reconcile\",\"note\":\"reconciled (no wake)\",\"ts\":\"$(now)\"}"
             fi
@@ -1434,7 +1771,15 @@ w = max(len(t) for t in order)
 for tid in order:
     o = state[tid]
     repos = ",".join(w_["repo"] for w_ in o.get("worktrees", [])) or "-"
-    print(f"{tid:<{w}}  {o.get('status','?'):<12}  {repos:<20}  {o.get('request','')[:60]}")
+    status = o.get("status", "?")
+    tail = o.get("request", "") or ""
+    # A settle the watcher suppressed because the HUMAN stopped the executor:
+    # never silently swallowed — it surfaces here (and in `reconcile`).
+    if status == "paused-by-human":
+        tail = "(stopped by you — steer it or let it resume) " + tail
+    elif o.get("cause") == "agent-error" and o.get("event") == "settled":
+        tail = "(settled on an AGENT/PROVIDER ERROR) " + tail
+    print(f"{tid:<{w}}  {status:<16}  {repos:<20}  {tail[:70]}")
 PY
 }
 
@@ -1445,14 +1790,16 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|handoff|done|report|reconcile|remove|prune|list|help> [args]
+Usage: task-worktree <create|handoff|done|report|classify|reconcile|remove|prune|list|help> [args]
 
   create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
   handoff   Baton-pass a task to a FRESH-context executor (same worktree/branch).
   done      (EXECUTORS) "I am finished" — record + notify + wake Dispatch.
   watch     Detached settle backstop for one task (armed automatically).
   report    Persist an executor's report durably; auto-close if --mode investigate.
+  classify  Why did an executor settle? (human /stop vs finished vs crashed)
   reconcile Repair ledger status from live herdr agent state.
+
   remove    Close a task and clean up (keeps the branch by default).
   prune     Reconcile: drop dangling worktree symlinks + unused repo links.
   list      Show task status from the ledger.
@@ -1474,6 +1821,7 @@ main() {
     _forget)  _settle_forget "$@" ;;
     _status)  _agent_status "$@" ;;
     report) cmd_report "$@" ;;
+    classify) cmd_classify "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
     remove) cmd_remove "$@" ;;
     prune)  cmd_prune "$@" ;;

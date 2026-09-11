@@ -23,6 +23,28 @@ project** (`~/Repositories/core`) and that we're working within it. That means
 inspection/answers should target `core` too. Only broaden or switch repos when the
 human explicitly says so.
 
+## Command map (read this instead of the script)
+
+Everything goes through `bin/task-worktree <verb>`. Nothing here blocks except
+`create` (a few seconds). You never need to read the script to use it.
+
+| verb | who runs it | what it does |
+|---|---|---|
+| `create` | you | worktree(s) + task dir + executor agent + backstop watcher. Prints the task id. |
+| `handoff <id>` | you | same worktree/branch, brand-new empty-context executor. |
+| `list` | you | instant task status from the ledger. **Your primary view.** |
+| `reconcile [id]` | you | repair ledger status from live herdr state (`--dry-run`, `--no-wake`). |
+| `report <id>` | you | persist the executor's report durably; auto-closes `investigate` tasks. |
+| `remove <id>` | you | teardown (`--delete-branch` optional). Explicit command only. |
+| `prune` | you | drop dangling symlinks. |
+| `classify <id>` | you (debug) | *why* an agent is idle: `human-interrupt` / `completed` / `agent-error` / `unknown`. |
+| `done` | **executors only** | "I'm finished/blocked" — the primary wake path. |
+| `watch <id>` | detached, automatic | backstop watcher; armed by `create`. |
+| `notify-settle` | internal | the one place a settle is recorded + announced. |
+
+Any verb takes `--help`. `bin/task-worktree-selftest` exercises the whole
+completion machinery against a fake herdr — run it after touching the script.
+
 ## How to spin a task
 
 Always use the one blessed path — never call `git worktree` or `herdr worktree`
@@ -112,7 +134,21 @@ bin/task-worktree           this blessed script
      loud**: it logs to `.dispatch/logs/watch-<id>.log`, records a
      `watcher-failed` settle, and wakes you — it never spins silently.
   After a settle the claim is released as soon as the executor resumes work, so a
-  task that settles → is steered → settles again reports each time. Because every
+  task that settles → is steered → settles again reports each time.
+- **The watcher classifies a settle before waking you.** herdr only knows an
+  agent is *idle*, not *why* — and **you** stopping an executor (pi `/stop`,
+  Esc) looks identical to it finishing. So the backstop reads pi's own session
+  log (`bin/task-worktree classify <id>`) and acts on the cause:
+  - `human-interrupt` — **no wake, no notification.** A durable `paused` event
+    (status `paused-by-human`) is recorded instead, so `list` and `reconcile`
+    surface it on your next turn. The watcher stays armed; the next genuine
+    settle reports normally.
+  - `completed` / `agent-error` / `blocked` / `unknown` — woken as usual.
+    Ambiguity always wakes; an `agent-error` wake is flagged as a probable
+    provider failure, not a finished task.
+  The executor's own `done` is **never** classified or suppressed, and a
+  suppression never touches the exactly-once claim. `TASK_SETTLE_CLASSIFY=0`
+  disables classification entirely (always wake). Because every
   settle is recorded to the ledger first, a lost wake never loses the result:
   `bin/task-worktree list` still shows it, and you'll catch it on the human's
   next turn. Do NOT ask the human whether to wait — let them carry on; you'll be
@@ -123,6 +159,8 @@ bin/task-worktree           this blessed script
   or blocked — routing them through the same exactly-once path. Cheap,
   non-blocking, and safe to run whenever `list` smells stale.
 - When a wake arrives (or you spot an `awaiting-dispatch` task in `list`):
+  0. If `list` shows **`paused-by-human`**, that task is not finished — you
+     stopped it. Don't report it; mention it and let it resume (or steer it).
   1. Read the executor's report. If it self-reported, the wake already carries
      the summary and `reports/<id>.executor.md` holds the full text — no terminal
      read needed. Otherwise `herdr agent read <id>` **before the agent workspace
