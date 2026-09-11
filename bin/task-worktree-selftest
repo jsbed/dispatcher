@@ -150,9 +150,42 @@ agent)
       sleep "$poll_s"; waited=$((waited + poll_ms))
     done
     ;;
-  prompt) printf 'PROMPT\t%s\t%s\n' "${1:-}" "${2:-}" >> "$LOG"; echo '{"result":{}}' ;;
+  prompt)
+    # One log LINE per prompt (newlines flattened), so `grep '^PROMPT'` counts
+    # wakes correctly even for a multi-line brief such as the autopilot one.
+    { printf 'PROMPT\t%s\t' "${1:-}"; printf '%s' "${2:-}" | tr '\n' ' '; printf '\n'; } >> "$LOG"
+    echo '{"result":{}}' ;;
   read)   echo '{"result":{}}' ;;
   *)      echo '{"result":{}}' ;;
+  esac ;;
+worktree)
+  sub="${2:-}"; shift 2
+  case "$sub" in
+  create)
+    path=""; branch=""; wbase=""; label=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --path)   path="$2"; shift 2 ;;
+        --branch) branch="$2"; shift 2 ;;
+        --base)   wbase="$2"; shift 2 ;;
+        --label)  label="$2"; shift 2 ;;
+        --cwd)    shift 2 ;;
+        *)        shift ;;
+      esac
+    done
+    mkdir -p "$path"
+    printf 'WORKTREE\t%s\t%s\t%s\t%s\n' "$label" "$branch" "$wbase" "$path" >> "$LOG"
+    printf '{"result":{"workspace":{"workspace_id":"ws-%s"},"worktree":{"path":"%s","branch":"%s"}}}\n' \
+      "$label" "$path" "$branch"
+    ;;
+  *) echo '{"result":{}}' ;;
+  esac ;;
+workspace)
+  sub="${2:-}"; shift 2
+  case "$sub" in
+  create)
+    printf '{"result":{"workspace":{"workspace_id":"ws-exec"},"root_pane":{"pane_id":"wX:p9"}}}\n' ;;
+  *) echo '{"result":{}}' ;;
   esac ;;
 notification) printf 'NOTIFY\t%s\n' "$*" >> "$LOG"; echo '{"result":{}}' ;;
 *) echo '{"result":{}}' ;;
@@ -160,6 +193,30 @@ esac
 exit 0
 STUB
 chmod +x "$STUB_BIN/herdr"
+
+# ---------------------------------------------------------------------------
+# the fake gh — `create --pr` resolves PRs through the GitHub CLI.
+#
+# Mirrors the real contract we depend on:
+#   gh pr view <n> --repo <owner/name> --json number,state,headRefName,url
+#     rc 0 + a JSON object when the PR exists
+#     rc 1 + "no pull requests found" on stderr when it does not
+# Fixtures live in $GH_STUB_STATE/<n>.json (see pr_fixture).
+# ---------------------------------------------------------------------------
+cat > "$STUB_BIN/gh" <<'STUB'
+#!/usr/bin/env bash
+set -uo pipefail
+printf 'GH\t%s\n' "$*" >> "${GH_STUB_LOG:-/dev/null}"
+if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
+  n="${3:-}"
+  f="${GH_STUB_STATE:-/nonexistent}/$n.json"
+  if [ -f "$f" ]; then cat "$f"; exit 0; fi
+  echo "no pull requests found for \"$n\"" >&2; exit 1
+fi
+echo '{}'
+exit 0
+STUB
+chmod +x "$STUB_BIN/gh"
 
 export PATH="$STUB_BIN:$PATH"
 # Defaults, so a probe made before the first setup() still works. Every case
@@ -394,6 +451,45 @@ seq_state() { printf '%s %s\n' "$2" "$3" > "$HERDR_STUB_STATE/$1"; }
 settles() { grep -c '"event":[ ]*"settled"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
 wakes()   { grep -c '^PROMPT' "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
 ledger()  { cat "$SANDBOX/.dispatch/ledger.jsonl"; }
+
+# ---------------------------------------------------------------------------
+# `create --pr` fixtures
+#
+# A throwaway git repo under a sandbox-scoped $REPOS, with a GitHub origin URL
+# (so the slug/compare-url derivation is real) and pre-seeded remote-tracking
+# refs (so no network is ever touched). The PR itself is a `gh` fixture.
+# ---------------------------------------------------------------------------
+GIT_Q() { git -c user.email=a@b -c user.name=a -c init.defaultBranch=main -C "$1" "${@:2}"; }
+
+pr_sandbox() {
+  # the real .dispatch/ prompt template, in the sandbox's .dispatch/
+  cp "$(dirname "$SRC")/../.dispatch/autopilot.PROMPT.md" "$SANDBOX/.dispatch/" 2>/dev/null \
+    || { bad "the autopilot prompt template exists in .dispatch/"; return 1; }
+  export TASK_REPOS_DIR="$SANDBOX/repos"
+  export TASK_WORKTREE_STORE="$SANDBOX/wtstore"
+  export GH_STUB_STATE="$SANDBOX/gh"
+  export GH_STUB_LOG="$SANDBOX/gh.log"
+  mkdir -p "$TASK_REPOS_DIR" "$TASK_WORKTREE_STORE" "$GH_STUB_STATE"
+  : > "$GH_STUB_LOG"
+}
+
+# mk_repo <repo> [extra-remote-branch ...]
+mk_repo() {
+  local repo="$1"; shift
+  local dir="$TASK_REPOS_DIR/$repo" b
+  mkdir -p "$dir"
+  git -c init.defaultBranch=main init -q "$dir"
+  GIT_Q "$dir" commit -q --allow-empty -m init
+  GIT_Q "$dir" remote add origin "git@github.com:acme/$repo.git"
+  GIT_Q "$dir" update-ref refs/remotes/origin/main HEAD
+  for b in "$@"; do GIT_Q "$dir" update-ref "refs/remotes/origin/$b" HEAD; done
+}
+
+# pr_fixture <number> <state> <headRefName>
+pr_fixture() {
+  printf '{"number":%s,"state":"%s","headRefName":"%s","url":"https://github.com/acme/widget/pull/%s","isCrossRepository":false,"title":"t"}\n' \
+    "$1" "$2" "$3" "$1" > "$GH_STUB_STATE/$1.json"
+}
 
 printf '\n\033[1mtask-worktree selftest\033[0m  (%s)\n' "$SRC"
 
@@ -817,10 +913,94 @@ is "first settle reported" "$first" "1"
 is "the missed turn's settle is reported too (no deadlock)" "$second" "2"
 }
 
+# ===========================================================================
+sect_21() {
+section "21. create --pr attaches a task to an existing PR branch"
+setup; pr_sandbox; mk_repo widget feature-x
+pr_fixture 7 OPEN feature-x
+pr_fixture 9 CLOSED old-branch
+
+err="$(TW create --slug pr-demo --repo widget --pr 7 --no-agent 2>&1 >"$SANDBOX/id.out")"; rc=$?
+id="$(cat "$SANDBOX/id.out")"
+is "create --pr succeeds" "$rc" "0"
+case "$err" in *"base: widget @ origin/feature-x"*) ok "the PR head is the base ref" ;;
+  *) bad "the PR head is the base ref" "$err" ;; esac
+wt="$(grep '^WORKTREE' "$HERDR_STUB_LOG" | head -1)"
+is "the worktree is cut from the PR branch, not off main" \
+   "$(printf '%s' "$wt" | cut -f2,3,4)" "$(printf 'widget\tfeature-x\torigin/feature-x')"
+env_file="$SANDBOX/tasks/$id/task.env"
+is "task.env records the branch" "$(. "$env_file" 2>/dev/null; echo "${TASK_BRANCH:-}")" "feature-x"
+is "task.env records TASK_PR_NUMBER" "$(. "$env_file" 2>/dev/null; echo "${TASK_PR_NUMBER:-}")" "7"
+is "task.env records TASK_PR_URL" "$(. "$env_file" 2>/dev/null; echo "${TASK_PR_URL:-}")" \
+   "https://github.com/acme/widget/pull/7"
+is "the mode stays 'code'" "$(. "$env_file" 2>/dev/null; echo "${TASK_MODE:-}")" "code"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'Autopilot PR 7'*) ok "the default request names the PR" ;;
+  *) bad "the default request names the PR" "$(tail -1 "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+
+# the slug is optional when --pr identifies the work
+setup; pr_sandbox; mk_repo widget feature-x; pr_fixture 7 OPEN feature-x
+id2="$(TW create --repo widget --pr 7 --no-agent 2>/dev/null)"
+case "$id2" in autopilot-pr-7-*) ok "--slug defaults to autopilot-pr-<N>" ;;
+  *) bad "--slug defaults to autopilot-pr-<N>" "got '$id2'" ;; esac
+
+# the executor is briefed with the autopilot loop
+setup; pr_sandbox; mk_repo widget feature-x; pr_fixture 7 OPEN feature-x
+TW create --repo widget --pr 7 >/dev/null 2>&1
+brief="$(grep '^PROMPT' "$HERDR_STUB_LOG" | head -1)"
+case "$brief" in *autopilot*|*Autopilot*) ok "the default prompt is the autopilot loop" ;;
+  *) bad "the default prompt is the autopilot loop" "$brief" ;; esac
+for want in 'feature-x' 'https://github.com/acme/widget/pull/7' 'gh pr checks'; do
+  case "$brief" in *"$want"*) ok "the brief is substituted with: $want" ;;
+    *) bad "the brief is substituted with: $want" "$brief" ;; esac
+done
+
+# an explicit --prompt / --request / --slug still wins
+setup; pr_sandbox; mk_repo widget feature-x; pr_fixture 7 OPEN feature-x
+id3="$(TW create --repo widget --pr 7 --slug mine --request "my words" --prompt "do it my way" 2>/dev/null)"
+case "$id3" in mine-*) ok "--slug overrides the autopilot default" ;;
+  *) bad "--slug overrides the autopilot default" "got '$id3'" ;; esac
+case "$(grep '^PROMPT' "$HERDR_STUB_LOG" | head -1)" in *'do it my way'*) ok "--prompt overrides the template" ;;
+  *) bad "--prompt overrides the template" "$(grep '^PROMPT' "$HERDR_STUB_LOG" | head -1)" ;; esac
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'my words'*) ok "--request overrides the default" ;;
+  *) bad "--request overrides the default" "$(tail -1 "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+
+# a PR that is not open must never be attached
+setup; pr_sandbox; mk_repo widget old-branch; pr_fixture 9 CLOSED old-branch
+out="$(TW create --repo widget --pr 9 --no-agent 2>&1)"; rc=$?
+is "a closed PR is refused" "$rc" "1"
+case "$out" in *CLOSED*|*'not open'*) ok "and says the PR is not open" ;;
+  *) bad "and says the PR is not open" "$out" ;; esac
+is "and no worktree is created for it" "$(grep -c '^WORKTREE' "$HERDR_STUB_LOG" | tr -d ' ')" "0"
+
+# a PR that does not exist at all
+setup; pr_sandbox; mk_repo widget
+out="$(TW create --repo widget --pr 404 --no-agent 2>&1)"; rc=$?
+is "an unknown PR fails loudly" "$rc" "1"
+
+# --pr owns the branch and the base; the caller may not also pick them
+setup; pr_sandbox; mk_repo widget feature-x; pr_fixture 7 OPEN feature-x
+out="$(TW create --slug x --repo widget --pr 7 --branch mine --no-agent 2>&1)"; rc=$?
+is "--pr with --branch is refused" "$rc" "1"
+case "$out" in *--branch*) ok "and the error names --branch" ;; *) bad "and the error names --branch" "$out" ;; esac
+out="$(TW create --slug x --repo widget --pr 7 --base main --no-agent 2>&1)"; rc=$?
+is "--pr with --base is refused" "$rc" "1"
+case "$out" in *--base*) ok "and the error names --base" ;; *) bad "and the error names --base" "$out" ;; esac
+
+# a PR url is accepted in place of a bare number
+setup; pr_sandbox; mk_repo widget feature-x; pr_fixture 7 OPEN feature-x
+id4="$(TW create --repo widget --pr https://github.com/acme/widget/pull/7 --no-agent 2>/dev/null)"
+is "a PR url resolves to the same branch" \
+   "$(. "$SANDBOX/tasks/$id4/task.env" 2>/dev/null; echo "${TASK_BRANCH:-}")" "feature-x"
+
+# help mentions the flag, so it is discoverable
+case "$(TW create --help 2>&1)" in *--pr*) ok "create --help documents --pr" ;;
+  *) bad "create --help documents --pr" ;; esac
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
-SECTION_ORDER="5 16 18 8 20 6 17 15 7 9 11 2 19 12 3 1 14 4 10 13 0"
+SECTION_ORDER="5 16 18 8 20 6 17 15 7 9 11 2 19 12 3 1 14 4 10 13 21 0"
 
 # ---------------------------------------------------------------------------
 # the runner

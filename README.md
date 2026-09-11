@@ -55,6 +55,15 @@ ledger lineage (`created → handoff`) all carry across.
 Every task starts from the freshly-fetched latest `main` tip unless you say
 otherwise.
 
+### Autopilot an existing PR
+
+`bin/task-worktree create --repo <repo> --pr <number|url>` attaches a code task to
+an existing **open** PR: the worktree is that PR's head branch (resolved with
+`gh`, base `origin/<head>`) and the executor is briefed from
+`.dispatch/autopilot.PROMPT.md` to drive conflicts → review comments → CI to
+green. `--pr` owns the branch and base (it refuses `--branch`/`--base`) and
+defaults the slug to `autopilot-pr-<N>`.
+
 ## How a task reports back
 
 The executor reports **itself**. Its final action, after committing and pushing,

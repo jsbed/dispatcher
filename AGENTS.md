@@ -85,6 +85,32 @@ bin/task-worktree create \
   records the compare link in `reports/<id>.md` for durability, and executors
   include it in their final report. Do not paste the compare link at spawn time.
 
+### Autopilot: "autopilot / babysit this PR"
+
+When the human says **"autopilot this PR" / "babysit this PR"** (or similar),
+they want a task attached to an **existing open PR** that drives it to green:
+conflicts → review comments → CI. You never babysit the PR yourself — you spawn
+the task and the executor runs the loop.
+
+- **Need the PR number** (or its URL). If they didn't give one, **ask** — never
+  guess which PR they mean.
+- Then spawn it with `--pr`, and nothing else:
+
+  ```
+  bin/task-worktree create --repo <repo> --pr <N> --request "<their words>"
+  ```
+
+- `--repo` defaults to **`core`** unless the human names another repo.
+- `--pr` owns the branch, the base and the brief: the worktree *is* the PR's head
+  branch, and the executor is briefed from `.dispatch/autopilot.PROMPT.md`.
+  **Do not invent `--branch`, `--base` or `--prompt`** — `--pr` refuses
+  `--branch`/`--base` anyway, and a hand-written `--prompt` throws the autopilot
+  loop away. The slug defaults to `autopilot-pr-<N>`.
+- It is a normal `code` task: same **no-poll** rule, same report-on-settle wake,
+  and it stays open at `awaiting-review` until the human says to close it. The
+  executor pushes to the PR branch; it never merges, auto-merges or marks the PR
+  ready.
+
 ## What lives where
 
 ```

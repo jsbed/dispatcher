@@ -122,20 +122,28 @@ _default_branch() {
   printf 'main\n'
 }
 
-# _compare_url <repo> <branch> -> prints the GitHub compare link (main...branch)
-# Converts the origin remote (git@ or https) to https and builds the compare URL
-# against the repo's default branch. Prints nothing if origin isn't GitHub.
-_compare_url() {
-  local repo="$1" branch="$2" url base slug
-  url="$(git -C "$REPOS/$repo" remote get-url origin 2>/dev/null || true)"
+# _github_slug <repo> -> prints 'owner/name' for the repo's origin remote.
+# Prints nothing (rc 0) when origin is missing or isn't GitHub.
+_github_slug() {
+  local url slug
+  url="$(git -C "$REPOS/$1" remote get-url origin 2>/dev/null || true)"
   [ -n "$url" ] || return 0
   case "$url" in
-    git@github.com:*) slug="${url#git@github.com:}" ;;
-    https://github.com/*) slug="${url#https://github.com/}" ;;
+    git@github.com:*)       slug="${url#git@github.com:}" ;;
+    https://github.com/*)   slug="${url#https://github.com/}" ;;
     ssh://git@github.com/*) slug="${url#ssh://git@github.com/}" ;;
     *) return 0 ;;
   esac
-  slug="${slug%.git}"
+  printf '%s\n' "${slug%.git}"
+}
+
+# _compare_url <repo> <branch> -> prints the GitHub compare link (main...branch)
+# Built from the origin remote's GitHub slug against the repo's default branch.
+# Prints nothing if origin isn't GitHub.
+_compare_url() {
+  local repo="$1" branch="$2" base slug
+  slug="$(_github_slug "$repo")"
+  [ -n "$slug" ] || return 0
   base="$(_default_branch "$repo")"
   printf 'https://github.com/%s/compare/%s...%s\n' "$slug" "$base" "$branch"
 }
@@ -1058,18 +1066,95 @@ Compare link for your branch: $compare"
   printf '\n'
 }
 
+# ---------------------------------------------------------------------------
+# create --pr : attach a task to an EXISTING open GitHub PR (Autopilot)
+#
+# The point of `--pr` is that the worktree must be the PR's own head branch, not
+# a fresh branch off main: an autopilot task exists to fix conflicts/review
+# comments/CI *on that PR*. So `--pr` OWNS the branch and the base, which is why
+# combining it with --branch/--base is a hard error rather than a merge of
+# intents. gh is the source of truth for the PR (state + head ref); we refuse
+# anything that is not open.
+# ---------------------------------------------------------------------------
+PR_NUMBER=""; PR_URL=""; PR_BRANCH=""      # set by _resolve_pr
+
+# _resolve_pr <repo> <number-or-url> -> sets PR_NUMBER / PR_URL / PR_BRANCH
+_resolve_pr() {
+  local repo="$1" want="$2" slug out rc=0 state
+  case "$want" in
+    *://*) want="${want##*/}" ;;              # .../pull/123 -> 123
+    '#'*)  want="${want#\#}" ;;
+  esac
+  case "$want" in
+    ''|*[!0-9]*) die "create: --pr wants a PR number or url (got '$2')" ;;
+  esac
+
+  slug="$(_github_slug "$repo")"
+  [ -n "$slug" ] || die "create: --pr needs repo '$repo' to have a GitHub origin remote"
+
+  out="$(gh pr view "$want" --repo "$slug" \
+          --json number,state,headRefName,url,isCrossRepository 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || die "create: gh could not read PR #$want in $slug: $out"
+
+  state="$(python3 - "$out" <<'PY'
+import json, sys
+d = json.loads(sys.argv[1])
+print("\t".join([str(d.get("number", "")), (d.get("state") or "").upper(),
+                 d.get("headRefName") or "", d.get("url") or "",
+                 "fork" if d.get("isCrossRepository") else ""]))
+PY
+)" || die "create: could not parse gh output for PR #$want"
+
+  PR_NUMBER="$(printf '%s' "$state" | cut -f1)"
+  local st fork
+  st="$(printf '%s' "$state" | cut -f2)"
+  PR_BRANCH="$(printf '%s' "$state" | cut -f3)"
+  PR_URL="$(printf '%s' "$state" | cut -f4)"
+  fork="$(printf '%s' "$state" | cut -f5)"
+
+  [ "$st" = "OPEN" ] || die "create: PR #$PR_NUMBER in $slug is $st, not open — nothing to autopilot"
+  [ -n "$PR_BRANCH" ] || die "create: PR #$PR_NUMBER has no head branch (gh returned: $out)"
+  [ -z "$fork" ] || die "create: PR #$PR_NUMBER comes from a fork; its head branch is not on $slug's origin"
+  [ -n "$PR_URL" ] || PR_URL="https://github.com/$slug/pull/$PR_NUMBER"
+}
+
+AUTOPILOT_PROMPT="$DISPATCH_DIR/autopilot.PROMPT.md"
+
+# _autopilot_prompt <repo> <pr-number> <pr-url> <branch> -> the rendered brief
+_autopilot_prompt() {
+  [ -f "$AUTOPILOT_PROMPT" ] \
+    || die "create: --pr needs the autopilot prompt template at $AUTOPILOT_PROMPT (or pass --prompt)"
+  python3 - "$AUTOPILOT_PROMPT" "$1" "$2" "$3" "$4" <<'PY'
+import sys
+path, repo, num, url, branch = sys.argv[1:6]
+with open(path) as fh:
+    text = fh.read()
+for k, v in (("REPO", repo), ("PR_NUMBER", num), ("PR_URL", url), ("BRANCH", branch)):
+    text = text.replace("{{%s}}" % k, v)
+sys.stdout.write(text)
+PY
+}
+
 usage_create() {
   cat >&2 <<EOF
 Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
-                            [--branch <name>] [--base <ref>] [--mode <mode>]
+                            [--branch <name>] [--base <ref>] [--pr <n|url>]
+                            [--mode <mode>]
                             [--agent <kind>] [--request "<your words>"]
                             [--prompt "<opening instruction>"] [--no-agent]
 
   --slug     Human slug for the task (a short nonce is appended -> the task id).
+             Optional with --pr (defaults to 'autopilot-pr-<n>').
   --repo     Repo under \$REPOS to work in. First --repo is the primary.
              Repeat for multi-repo tasks.
   --branch   Branch name (default: the task id).
   --base     Base ref for new branches (default: HEAD of each repo).
+  --pr       Attach the task to an EXISTING open GitHub PR (number or url),
+             resolved with gh against the first --repo. The worktree is that
+             PR's head branch (base origin/<head>), the executor is briefed
+             with the autopilot loop, and TASK_PR_URL/TASK_PR_NUMBER land in
+             task.env. Cannot be combined with --branch or --base; --slug,
+             --request and --prompt still override their defaults.
   --mode     Task lifecycle (default: 'code'):
                code        touches the tree; stays open for review, closed later.
                investigate read-only find/answer; reports and auto-closes itself.
@@ -1082,7 +1167,7 @@ EOF
 
 cmd_create() {
   local slug="" branch="" base="" agent="$DEFAULT_AGENT_KIND"
-  local request="" prompt="" no_agent=0 mode="code"
+  local request="" prompt="" no_agent=0 mode="code" pr=""
   local -a repos=()
 
   while [ $# -gt 0 ]; do
@@ -1091,6 +1176,7 @@ cmd_create() {
       --repo)    repos+=("$2"); shift 2 ;;
       --branch)  branch="$2"; shift 2 ;;
       --base)    base="$2"; shift 2 ;;
+      --pr)      pr="$2"; shift 2 ;;
       --mode)    mode="$2"; shift 2 ;;
       --agent)   agent="$2"; shift 2 ;;
       --request) request="$2"; shift 2 ;;
@@ -1101,12 +1187,36 @@ cmd_create() {
     esac
   done
 
-  [ -n "$slug" ]        || { usage_create; die "create: --slug required"; }
   [ "${#repos[@]}" -gt 0 ] || { usage_create; die "create: at least one --repo required"; }
   case "$mode" in
     code|investigate) ;;
     *) die "create: --mode must be 'code' or 'investigate' (got '$mode')" ;;
   esac
+
+  # --pr: resolve the PR FIRST, so nothing is created for a PR we will refuse.
+  if [ -n "$pr" ]; then
+    [ -z "$branch" ] || die "create: --pr cannot be combined with --branch (the PR's head branch is used)"
+    [ -z "$base" ]   || die "create: --pr cannot be combined with --base (the PR head tip is the base)"
+    [ "${#repos[@]}" -eq 1 ] \
+      || die "create: --pr takes exactly one --repo (the PR lives in one repo; got ${#repos[@]})"
+    have gh || die "create: --pr needs the GitHub CLI ('gh') on PATH"
+    _resolve_repo "${repos[0]}"
+    _resolve_pr "${repos[0]}" "$pr"
+    branch="$PR_BRANCH"
+    base="origin/$PR_BRANCH"
+    info "PR #$PR_NUMBER: $PR_URL (head: $branch)"
+    info "fetching PR head ${repos[0]}/$branch ..."
+    git -C "$REPOS/${repos[0]}" fetch --quiet origin \
+        "+refs/heads/$branch:refs/remotes/origin/$branch" 2>/dev/null \
+      || info "warning: fetch failed for ${repos[0]} (falling back to the local remote-tracking ref)"
+    git -C "$REPOS/${repos[0]}" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null \
+      || die "create: cannot resolve origin/$branch in ${repos[0]} — fetch the PR head and retry"
+    [ -n "$slug" ]    || slug="autopilot-pr-$PR_NUMBER"
+    [ -n "$request" ] || request="Autopilot PR $PR_NUMBER"
+    [ -n "$prompt" ]  || prompt="$(_autopilot_prompt "${repos[0]}" "$PR_NUMBER" "$PR_URL" "$branch")"
+  fi
+
+  [ -n "$slug" ] || { usage_create; die "create: --slug required"; }
 
   # sanitize slug: lowercase, non-alnum -> '-'
   slug="$(printf '%s' "$slug" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-//; s/-$//')"
@@ -1200,6 +1310,8 @@ TASK_PRIMARY_REPO="$primary"
 TASK_REPOS="${repos[*]}"
 TASK_DISPATCH_PANE="$dispatch_pane"
 TASK_COMPARE_URL="$task_compare"
+TASK_PR_NUMBER="$PR_NUMBER"
+TASK_PR_URL="$PR_URL"
 TASK_WORKTREE_BIN="$SELF"
 EOF
 
@@ -1246,16 +1358,17 @@ $(_done_brief "$id" "$task_compare")"
   local entry
   entry="$(python3 - "$id" "$slug" "$branch" "$primary" "$agent" \
                     "$request" "$prompt" "$exec_wsid" "$mode" "$(now)" "$wts" \
-                    "$dispatch_pane" "$task_compare" <<'PY'
+                    "$dispatch_pane" "$task_compare" "$PR_NUMBER" "$PR_URL" <<'PY'
 import json, sys
 (id_, slug, branch, primary, agent, request, prompt, exec_ws, mode, ts, wts,
- pane, compare) = sys.argv[1:14]
+ pane, compare, pr_num, pr_url) = sys.argv[1:16]
 print(json.dumps({
     "event": "created",
     "id": id_, "slug": slug, "branch": branch, "primary_repo": primary,
     "agent_kind": agent, "mode": mode, "request": request, "prompt": prompt,
     "executor_workspace_id": exec_ws or None,
     "dispatch_pane": pane or None, "compare": compare or None,
+    "pr_number": int(pr_num) if pr_num else None, "pr_url": pr_url or None,
     "worktrees": json.loads("[" + wts + "]"),
     "status": "working", "ts": ts,
 }))
