@@ -9,6 +9,7 @@
 #
 # Subcommands:
 #   create   Create worktree(s) + ephemeral task dir + spawn an executor agent.
+#   handoff  Swap in a fresh-context executor on an existing worktree/branch.
 #   remove   Tear down a task: herdr worktrees, symlinks, task dir, ledger.
 #   prune    Garbage-collect dangling worktree symlinks + unused repo symlinks.
 #   list     Show current task status derived from the ledger.
@@ -383,7 +384,10 @@ Usage: task-worktree remove <task-id> [--delete-branch]
 EOF
 }
 
-# _find_created_rec <id>  -> prints the latest 'created' ledger record (or empty)
+# _find_created_rec <id>  -> prints the latest task record (or empty).
+# Matches 'created' OR 'handoff' events: a handoff replaces the executor and
+# carries a FRESH executor_workspace_id plus the copied worktrees/branch/mode,
+# so teardown/report always act on the LIVE workspace, not a stale one.
 _find_created_rec() {
   python3 - "$LEDGER" "$1" <<'PY'
 import json, sys
@@ -394,7 +398,7 @@ for line in open(path):
     if not line: continue
     try: o = json.loads(line)
     except Exception: continue
-    if o.get("id") == id_ and o.get("event") == "created":
+    if o.get("id") == id_ and o.get("event") in ("created", "handoff"):
         found = o
 print(json.dumps(found) if found else "")
 PY
@@ -452,6 +456,138 @@ cmd_remove() {
   local rec; rec="$(_find_created_rec "$id")"
   [ -n "$rec" ] || die "no ledger record for task '$id'"
   _teardown_from_rec "$rec" "$delete_branch" "$id"
+}
+
+# ---------------------------------------------------------------------------
+# handoff — baton-pass an existing task to a FRESH-context executor
+# ---------------------------------------------------------------------------
+usage_handoff() {
+  cat >&2 <<EOF
+Usage: task-worktree handoff <task-id> [--prompt "<opening instruction>"]
+                            [--note-from <path>] [--agent <kind>]
+
+  Replaces the idle executor on an existing task with a brand-new, empty-context
+  agent, keeping the SAME worktree(s), branch, uncommitted changes and PR — the
+  baton pass. The old executor workspace (its context) is closed; the worktrees
+  are untouched. The existing re-arming watcher keeps tracking the task id, so
+  no duplicate watcher is armed.
+
+  --prompt     Opening instruction for the fresh agent (defaults to a generic
+               "continue this task" brief).
+  --note-from  File whose contents are handed to the fresh agent as a handoff
+               note (e.g. the prior agent's HANDOFF.md). Optional but strongly
+               recommended — the old agent's knowledge lives in the tree/notes,
+               not in the discarded context.
+  --agent      Executor kind for the fresh agent (default: the task's original).
+EOF
+}
+
+cmd_handoff() {
+  local id="" prompt="" note_file="" agent=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --prompt)    prompt="$2"; shift 2 ;;
+      --note-from) note_file="$2"; shift 2 ;;
+      --agent)     agent="$2"; shift 2 ;;
+      -h|--help)   usage_handoff; return 0 ;;
+      -*) die "handoff: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "handoff: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_handoff; die "handoff: task id required"; }
+
+  local rec; rec="$(_find_created_rec "$id")"
+  [ -n "$rec" ] || die "handoff: no ledger record for task '$id'"
+
+  local mode branch primary old_ws agent_kind
+  mode="$(jget "$rec" "d.get('mode') or 'code'")"
+  branch="$(jget "$rec" "d.get('branch') or ''")"
+  primary="$(jget "$rec" "d.get('primary_repo') or ''")"
+  old_ws="$(jget "$rec" "d.get('executor_workspace_id') or ''")"
+  agent_kind="$(jget "$rec" "d.get('agent_kind') or '$DEFAULT_AGENT_KIND'")"
+  [ -n "$agent" ] && agent_kind="$agent"
+
+  local task_dir="$TASKS_DIR/$id"
+  [ -d "$task_dir" ] || die "handoff: task dir missing ($task_dir) — is the task closed?"
+
+  local note=""
+  if [ -n "$note_file" ]; then
+    [ -f "$note_file" ] || die "handoff: --note-from not found: $note_file"
+    note="$(cat "$note_file")"
+  fi
+  [ -n "$prompt" ] || prompt="You are taking over this in-progress task with a fresh context. Read ./AGENTS.md and inspect the working tree (including any HANDOFF note / recent commits) to see what the previous executor did, then carry the work to completion."
+
+  info "handoff: task $id  branch $branch  agent $agent_kind"
+
+  # 1. Close the prior executor workspace (discards the old context). The
+  #    worktree workspaces are separate, so uncommitted work is preserved.
+  if [ -n "$old_ws" ] && [ "$old_ws" != "None" ]; then
+    herdr workspace close "$old_ws" >/dev/null 2>&1 \
+      && info "closed prior executor workspace $old_ws" \
+      || info "warning: could not close prior executor workspace $old_ws (continuing)"
+  fi
+
+  # 2. Fresh executor workspace + agent, rooted at the SAME task dir (which
+  #    already symlinks to the existing worktree(s)).
+  local out new_ws new_pane
+  out="$(herdr workspace create --cwd "$task_dir" --label "$id" --no-focus 2>&1)" \
+    || { printf '%s\n' "$out" >&2; die "handoff: herdr workspace create failed"; }
+  new_ws="$(jget "$out" "d['result']['workspace']['workspace_id']")"
+  new_pane="$(jget "$out" "d['result']['root_pane']['pane_id']")"
+  info "new executor workspace: $new_ws  pane: $new_pane"
+
+  herdr agent start "$id" --kind "$agent_kind" --pane "$new_pane" >/dev/null 2>&1 \
+    || die "handoff: herdr agent start failed (kind=$agent_kind pane=$new_pane)"
+  info "started fresh $agent_kind agent '$id'"
+
+  # 3. Brief the fresh agent: prompt + optional handoff note + standard footer.
+  local full="$prompt"
+  [ -n "$note" ] && full="$full
+
+--- handoff note ---
+$note
+--- end handoff note ---"
+  full="$full
+
+Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch)."
+  herdr agent prompt "$id" "$full" >/dev/null 2>&1 \
+    || info "warning: agent prompt submission failed; brief the agent manually"
+
+  # 4. Ledger 'handoff' event — copies the task's worktrees/branch/mode from the
+  #    prior record but records the NEW executor_workspace_id so teardown/report
+  #    act on the live workspace. status stays 'working'.
+  local entry
+  entry="$(python3 - "$rec" "$id" "$new_ws" "$prompt" "$note" "$(now)" <<'PY'
+import json, sys
+(rec, id_, new_ws, prompt, note, ts) = sys.argv[1:7]
+o = json.loads(rec)
+print(json.dumps({
+    "event": "handoff",
+    "id": id_,
+    "slug": o.get("slug"),
+    "branch": o.get("branch"),
+    "primary_repo": o.get("primary_repo"),
+    "agent_kind": o.get("agent_kind"),
+    "mode": o.get("mode") or "code",
+    "request": o.get("request"),
+    "prompt": prompt,
+    "handoff_note": note or None,
+    "executor_workspace_id": new_ws or None,
+    "worktrees": o.get("worktrees", []),
+    "status": "working",
+    "ts": ts,
+}))
+PY
+)"
+  ledger_append "$entry"
+
+  # 5. Watcher: the original re-arming watcher keys on the task id and is parked
+  #    in its "wait for work to resume" phase, so it picks up the fresh agent —
+  #    no second watcher is armed (avoids duplicate settle records / wakes).
+  info "reused existing re-arming watcher for $id (no duplicate armed)"
+
+  printf '\n✔ handoff complete for %s\n  task dir: %s\n' "$id" "$task_dir" >&2
+  echo "$id"
 }
 
 # ---------------------------------------------------------------------------
@@ -626,9 +762,10 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|report|remove|prune|list|help> [args]
+Usage: task-worktree <create|handoff|report|remove|prune|list|help> [args]
 
   create   Spin a task: worktree(s) + ephemeral task dir + executor agent.
+  handoff  Baton-pass a task to a FRESH-context executor (same worktree/branch).
   report   Persist an executor's report durably; auto-close if --mode investigate.
   remove   Close a task and clean up (keeps the branch by default).
   prune    Reconcile: drop dangling worktree symlinks + unused repo links.
@@ -642,6 +779,7 @@ main() {
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
     create) cmd_create "$@" ;;
+    handoff) cmd_handoff "$@" ;;
     report) cmd_report "$@" ;;
     remove) cmd_remove "$@" ;;
     prune)  cmd_prune "$@" ;;
