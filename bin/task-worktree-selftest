@@ -1,0 +1,340 @@
+#!/usr/bin/env bash
+#
+# task-worktree-selftest — exercises the completion machinery of task-worktree
+# against a scripted fake herdr, so the watcher is TESTED rather than eyeballed.
+#
+# It covers the two failure modes that previously bit us:
+#   * the multi-value `--until idle done blocked` invocation (herdr rc=2), which
+#     silently turned every settle probe into "false" and made the watcher spin
+#     forever without recording anything, and
+#   * the boot transient, where a freshly-booted agent reads idle/done BEFORE it
+#     starts working and can trigger a FALSE settle.
+# plus the exactly-once + re-arming guarantees of the settle claim.
+#
+# Usage: bin/task-worktree-selftest [-v]
+#
+# The fake herdr mirrors the REAL CLI contract, verified against live agents:
+#   agent wait  --until <ONE status>, REPEAT for more; a second bare word is
+#               "unknown option: <word>" with exit code 2.
+#               rc 0 matched | rc 1 timeout/not-found | rc 2 bad invocation.
+#   agent get   prints agent_status + state_change_seq, rc 1 when not found.
+set -uo pipefail
+
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task-worktree"
+VERBOSE=0
+[ "${1:-}" = "-v" ] && VERBOSE=1
+
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
+bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [ -n "${2:-}" ] && printf '       %s\n' "$2"; }
+is()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected '$3', got '$2'"; fi; }
+note() { [ "$VERBOSE" -eq 1 ] && printf '       · %s\n' "$*"; return 0; }
+
+TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/tw-selftest.XXXXXX")"
+trap 'pkill -f "$TMPROOT" >/dev/null 2>&1; rm -rf "$TMPROOT"' EXIT
+
+# ---------------------------------------------------------------------------
+# the fake herdr
+# ---------------------------------------------------------------------------
+STUB_BIN="$TMPROOT/stub"
+mkdir -p "$STUB_BIN"
+cat > "$STUB_BIN/herdr" <<'STUB'
+#!/usr/bin/env bash
+# Fake herdr. State lives in $HERDR_STUB_STATE/<agent> as "<status> <seq>".
+set -uo pipefail
+S="$HERDR_STUB_STATE"; LOG="$HERDR_STUB_LOG"
+read_state() { [ -f "$S/$1" ] || return 1; cat "$S/$1"; }
+
+case "${1:-}" in
+agent)
+  sub="${2:-}"; shift 2
+  case "$sub" in
+  get)
+    st="$(read_state "${1:-}")" || { echo '{"error":{"code":"agent_not_found"}}'; exit 1; }
+    set -- $st
+    printf '{"id":"cli:agent:get","result":{"agent":{"agent":"pi","agent_status":"%s","state_change_seq":%s,"name":"x","pane_id":"p1","cwd":"/x"}}}\n' "$1" "$2"
+    ;;
+  list)
+    printf '{"result":{"agents":['; sep=""
+    for f in "$S"/*; do
+      [ -e "$f" ] || continue
+      set -- $(cat "$f")
+      printf '%s{"agent":"pi","agent_status":"%s","state_change_seq":%s,"name":"%s","pane_id":"p1","cwd":"/x"}' "$sep" "$1" "$2" "$(basename "$f")"
+      sep=","
+    done
+    printf ']}}\n'
+    ;;
+  wait)
+    target=""; timeout=""; want=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --until)
+          case "$2" in
+            idle|working|blocked|done|unknown) want="$want $2"; shift 2 ;;
+            *) echo "unknown option: $2" >&2; exit 2 ;;
+          esac ;;
+        --timeout) timeout="$2"; shift 2 ;;
+        -*) echo "unknown option: $1" >&2; exit 2 ;;
+        *)
+          # REAL herdr behaviour: exactly one positional target. A second bare
+          # word (as produced by `--until idle done blocked`) is a hard error.
+          if [ -n "$target" ]; then echo "unknown option: $1" >&2; exit 2; fi
+          target="$1"; shift ;;
+      esac
+    done
+    [ -n "$want" ] || want=" idle done blocked"          # bare wait default
+    deadline_ms="${timeout:-${HERDR_STUB_MAXWAIT_MS:-20000}}"
+    waited=0
+    while :; do
+      st="$(read_state "$target")" || { echo '{"error":{"code":"agent_not_found"}}'; exit 1; }
+      set -- $st
+      for w in $want; do
+        [ "$w" = "$1" ] && { printf '{"result":{"agent":{"agent_status":"%s"}}}\n' "$1"; exit 0; }
+      done
+      [ "$waited" -ge "$deadline_ms" ] && { echo '{"error":{"code":"timeout"}}'; exit 1; }
+      sleep 0.1; waited=$((waited + 100))
+    done
+    ;;
+  prompt) printf 'PROMPT\t%s\t%s\n' "${1:-}" "${2:-}" >> "$LOG"; echo '{"result":{}}' ;;
+  read)   echo '{"result":{}}' ;;
+  *)      echo '{"result":{}}' ;;
+  esac ;;
+notification) printf 'NOTIFY\t%s\n' "$*" >> "$LOG"; echo '{"result":{}}' ;;
+*) echo '{"result":{}}' ;;
+esac
+exit 0
+STUB
+chmod +x "$STUB_BIN/herdr"
+
+export PATH="$STUB_BIN:$PATH"
+export HERDR_STUB_STATE="$TMPROOT/state"
+export HERDR_STUB_LOG="$TMPROOT/herdr.log"
+export TASK_WATCH_DEBOUNCE=1
+export HERDR_STUB_MAXWAIT_MS=4000
+
+AID="demo-task-abc"
+
+# ---------------------------------------------------------------------------
+# sandbox helpers
+# ---------------------------------------------------------------------------
+SANDBOX=""
+setup() {
+  pkill -f "$TMPROOT.*watch" >/dev/null 2>&1; sleep 0.3
+  SANDBOX="$TMPROOT/run$RANDOM$RANDOM"
+  mkdir -p "$SANDBOX/bin" "$SANDBOX/tasks/$AID" "$HERDR_STUB_STATE"
+  cp "$SRC" "$SANDBOX/bin/task-worktree"
+  rm -f "$HERDR_STUB_STATE"/* "$HERDR_STUB_LOG"
+  : > "$HERDR_STUB_LOG"
+  mkdir -p "$SANDBOX/.dispatch"
+  printf '%s\n' "{\"event\":\"created\",\"id\":\"$AID\",\"slug\":\"demo\",\"branch\":\"demo\",\"primary_repo\":\"none\",\"mode\":\"code\",\"dispatch_pane\":\"wDISPATCH:p1\",\"status\":\"working\",\"ts\":\"x\"}" \
+    > "$SANDBOX/.dispatch/ledger.jsonl"
+}
+TW() { "$SANDBOX/bin/task-worktree" "$@"; }
+# Kill any watcher left over from a previous case. The pattern is scoped to this
+# test run's temp dir, so it can never touch a real watcher.
+stop_watchers() { pkill -f "$TMPROOT.*watch" >/dev/null 2>&1; sleep 0.5; return 0; }
+state() { printf '%s %s\n' "$2" "${3:-$((RANDOM + 1000))}" > "$HERDR_STUB_STATE/$1"; }
+# seq_state <agent> <status> <seq>  — explicit, monotonic
+seq_state() { printf '%s %s\n' "$2" "$3" > "$HERDR_STUB_STATE/$1"; }
+settles() { grep -c '"event":[ ]*"settled"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
+wakes()   { grep -c '^PROMPT' "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
+ledger()  { cat "$SANDBOX/.dispatch/ledger.jsonl"; }
+
+printf '\n\033[1mtask-worktree selftest\033[0m  (%s)\n\n' "$SRC"
+
+# ===========================================================================
+printf '\033[1m0. the script parses\033[0m\n'
+# ===========================================================================
+# Guards a nasty bash 3.2 (macOS) trap: inside $( ... ), the parser scans the
+# heredoc body for quotes, so a lone apostrophe in a python comment silently
+# breaks the whole script.
+err="$(bash -n "$SRC" 2>&1)"
+is "bash -n is clean (watch for apostrophes in heredocs inside \$())" "${err:-clean}" "clean"
+
+# ===========================================================================
+printf '\n\033[1m1. herdr --until contract (the regression that broke the watcher)\033[0m\n'
+# ===========================================================================
+herdr agent wait x --until idle done blocked >/dev/null 2>&1; rc=$?
+is "multi-value '--until idle done blocked' exits rc=2" "$rc" "2"
+
+setup; seq_state "$AID" idle 10
+herdr agent wait "$AID" --until idle --until done --until blocked --timeout 500 >/dev/null 2>&1
+is "repeated --until matches an idle agent (rc=0)" "$?" "0"
+herdr agent wait "$AID" --timeout 500 >/dev/null 2>&1
+is "bare wait defaults to idle/done/blocked (rc=0)" "$?" "0"
+herdr agent wait "$AID" --until working --timeout 300 >/dev/null 2>&1
+is "no-match is rc=1, not rc=2" "$?" "1"
+
+# real (non-comment) code lines only
+hits="$(grep -nE -- '--until [a-z]+ [a-z]+' "$SRC" | grep -vE '^[0-9]+: *#' | head -1)"
+if [ -n "$hits" ]; then
+  bad "the script never passes a multi-value --until" "found: $hits"
+else
+  ok "the script never passes a multi-value --until"
+fi
+
+# ===========================================================================
+printf '\n\033[1m2. exactly-once: executor done + watcher backstop\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 20
+TW done "$AID" --note "primary path" >/dev/null 2>&1
+is "executor 'done' records one settle" "$(settles)" "1"
+is "executor 'done' wakes Dispatch once" "$(wakes)" "1"
+
+seq_state "$AID" idle 21                       # the agent then goes idle
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch >/dev/null 2>&1
+is "watcher backstop is suppressed (still 1 settle)" "$(settles)" "1"
+is "watcher backstop does not double-wake" "$(wakes)" "1"
+
+TW done "$AID" --note "same settle again" >/dev/null 2>&1
+is "a repeated 'done' in the same settle is suppressed" "$(settles)" "1"
+
+TW done "$AID" --note "forced" --force >/dev/null 2>&1
+is "--force overrides the claim" "$(settles)" "2"
+
+# ===========================================================================
+printf '\n\033[1m3. re-arming: settle -> steer -> settle reports every time\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" idle 30
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch >/dev/null 2>&1
+is "first settle reported" "$(settles)" "1"
+
+seq_state "$AID" working 31
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch >/dev/null 2>&1
+is "no report while the claim is still held" "$(settles)" "1"
+
+# the watcher observes the resume and releases the claim
+TW _release "$AID" >/dev/null 2>&1 || true
+seq_state "$AID" idle 32
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch >/dev/null 2>&1
+is "second settle reports after release (re-armed)" "$(settles)" "2"
+is "and wakes Dispatch again" "$(wakes)" "2"
+
+# ===========================================================================
+printf '\n\033[1m4. re-arming survives a DEAD watcher (seq-advance fallback)\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 40
+TW done "$AID" --note "first" >/dev/null 2>&1
+is "executor reports settle 1" "$(settles)" "1"
+# nobody ever releases the claim (watcher dead). The executor is steered,
+# works again, and reports: herdr's seq has advanced, so it is a NEW settle.
+seq_state "$AID" working 45
+TW done "$AID" --note "second, after being steered" >/dev/null 2>&1
+is "executor reports settle 2 anyway" "$(settles)" "2"
+
+# ===========================================================================
+printf '\n\033[1m5. watcher: boot transient must NOT produce a false settle\033[0m\n'
+# ===========================================================================
+setup
+# The classic race: the agent reads idle/done for a moment right after boot.
+seq_state "$AID" idle 50
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 3
+early="$(settles)"
+seq_state "$AID" working 51                    # ... then it actually starts
+sleep 3
+mid="$(settles)"
+seq_state "$AID" idle 52                       # ... and genuinely finishes
+sleep 6
+final="$(settles)"
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "no settle recorded during the boot transient" "$early" "0"
+is "no settle recorded while working" "$mid" "0"
+is "exactly one settle recorded after the real finish" "$final" "1"
+is "Dispatch woken exactly once" "$(wakes)" "1"
+note "$(ledger | tail -1)"
+
+# ===========================================================================
+printf '\n\033[1m6. watcher: settle is detected at all (the spin-forever bug)\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 60
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 2
+seq_state "$AID" idle 61
+sleep 6
+got="$(settles)"
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "a working->idle transition is recorded" "$got" "1"
+if grep -q '"status": *"awaiting-dispatch"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "recorded with status awaiting-dispatch"
+else bad "recorded with status awaiting-dispatch" "$(ledger | tail -1)"; fi
+
+# ===========================================================================
+printf '\n\033[1m7. watcher: blocked settles are reported as blocked\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 70
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 2; seq_state "$AID" blocked 71; sleep 6
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+if grep -q '"status": *"blocked"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "blocked settle recorded as blocked"
+else bad "blocked settle recorded as blocked" "$(ledger | tail -1)"; fi
+
+# ===========================================================================
+printf '\n\033[1m8. watcher: re-arms on a second settle (live)\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 80
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 2; seq_state "$AID" idle 81;    sleep 5
+first="$(settles)"
+seq_state "$AID" working 82;          sleep 4      # steered
+seq_state "$AID" idle 83;             sleep 6      # settles again
+second="$(settles)"
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "first settle reported" "$first" "1"
+is "second settle reported too (re-armed)" "$second" "2"
+is "Dispatch woken exactly twice, once per settle" "$(wakes)" "2"
+
+# ===========================================================================
+printf '\n\033[1m9. watcher FAILS LOUD instead of spinning\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 90
+( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
+sleep 2
+rm -f "$HERDR_STUB_STATE/$AID"                 # the agent vanishes: herdr errors
+sleep 8
+alive=0; kill -0 "$WPID" 2>/dev/null && alive=1
+kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+is "watcher exits instead of looping on a herdr failure" "$alive" "0"
+if grep -q 'watcher-failed' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "the failure is recorded durably in the ledger"
+else bad "the failure is recorded durably in the ledger" "$(ledger | tail -2)"; fi
+if grep -q 'ABORT' "$SANDBOX/.dispatch/logs/watch-$AID.log" 2>/dev/null; then
+  ok "and logged to .dispatch/logs/watch-<id>.log"
+else bad "and logged to .dispatch/logs/watch-<id>.log"; fi
+
+# ===========================================================================
+printf '\n\033[1m10. reconcile repairs a ledger stuck at working\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" idle 100
+out="$(TW reconcile --dry-run 2>&1)"
+case "$out" in *REPAIR*) ok "dry-run spots the stuck task" ;; *) bad "dry-run spots the stuck task" "$out" ;; esac
+is "dry-run writes nothing" "$(settles)" "0"
+TW reconcile >/dev/null 2>&1
+is "reconcile records the missed settle" "$(settles)" "1"
+TW reconcile >/dev/null 2>&1
+is "reconcile is idempotent" "$(settles)" "1"
+
+# ===========================================================================
+printf '\n\033[1m11. done ergonomics\033[0m\n'
+# ===========================================================================
+setup; seq_state "$AID" working 110
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+( cd "$SANDBOX/tasks/$AID" && "$SANDBOX/bin/task-worktree" done --note "found my own id" >/dev/null 2>&1 )
+is "'done' with no id infers it from ./task.env" "$(settles)" "1"
+
+setup; seq_state "$AID" working 111
+TW done "$AID" >/dev/null 2>&1
+is "'done' without --note is rejected" "$?" "1"
+is "and records nothing" "$(settles)" "0"
+
+setup; seq_state "$AID" working 112
+printf 'full body\n' > "$TMPROOT/body.md"
+TW done "$AID" --note n --pr "https://x/pr/1" --body-file "$TMPROOT/body.md" >/dev/null 2>&1
+if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then ok "--body-file is persisted to reports/<id>.executor.md"
+else bad "--body-file is persisted to reports/<id>.executor.md"; fi
+if grep -q 'https://x/pr/1' "$HERDR_STUB_LOG"; then ok "the PR url reaches the Dispatch wake"
+else bad "the PR url reaches the Dispatch wake" "$(cat "$HERDR_STUB_LOG")"; fi
+
+printf '\n\033[1m%d passed, %d failed\033[0m\n\n' "$PASS" "$FAIL"
+[ "$FAIL" -eq 0 ]

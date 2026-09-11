@@ -20,12 +20,14 @@ executor finishes it reports back, and Dispatch surfaces the result to you.
 `bin/task-worktree` is the blessed path — never call `git worktree` by hand:
 
 ```
-bin/task-worktree create   # spin a task: worktree + executor agent
-bin/task-worktree handoff  # swap in a fresh-context executor (same worktree/branch)
-bin/task-worktree report   # persist an executor's report; auto-close if investigative
-bin/task-worktree list     # task status from the ledger
-bin/task-worktree remove   # close a task and clean up (keeps the branch)
-bin/task-worktree prune    # reconcile dangling symlinks
+bin/task-worktree create     # spin a task: worktree + executor agent
+bin/task-worktree handoff    # swap in a fresh-context executor (same worktree/branch)
+bin/task-worktree done       # (executors) "I am finished" — wakes Dispatch
+bin/task-worktree report     # persist an executor's report; auto-close if investigative
+bin/task-worktree list       # task status from the ledger
+bin/task-worktree reconcile  # repair ledger status from live herdr state
+bin/task-worktree remove     # close a task and clean up (keeps the branch)
+bin/task-worktree prune      # reconcile dangling symlinks
 ```
 
 Two kinds of task:
@@ -51,6 +53,33 @@ ledger lineage (`created → handoff`) all carry across.
 
 Every task starts from the freshly-fetched latest `main` tip unless you say
 otherwise.
+
+## How a task reports back
+
+The executor reports **itself**. Its final action, after committing and pushing,
+is:
+
+```
+bin/task-worktree done --note "<summary>" [--pr <url>] [--body-file report.md]
+```
+
+which appends a durable `settled` event to the ledger, notifies you on the
+desktop, and wakes Dispatch. `create` writes a `task.env` into the task workspace
+so the executor knows its own id and which pane to wake — no guessing.
+
+A detached `bin/task-worktree watch <id>` runs as a **backstop** for the case
+where an executor dies or forgets. Both paths take the same per-task *settle
+claim* before recording anything, so **Dispatch is woken exactly once per
+settle** — and the claim is released when the executor resumes work, so a task
+that settles, gets steered, and settles again reports every time.
+
+If a watcher ever breaks it fails **loud**: it logs to
+`.dispatch/logs/watch-<id>.log`, records a `watcher-failed` settle and wakes
+Dispatch, rather than spinning silently. `bin/task-worktree reconcile` repairs
+any task whose ledger status drifted from live herdr state.
+
+`bin/task-worktree-selftest` exercises all of this against a scripted fake herdr
+(exactly-once, re-arming, the boot-transient guard, and the fail-loud paths).
 
 ## What's tracked here
 

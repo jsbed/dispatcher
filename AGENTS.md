@@ -96,22 +96,40 @@ bin/task-worktree           this blessed script
   pushes you, or (b) opportunistically on any turn the human already started, via
   `bin/task-worktree list`. Between those moments you stay idle and available. A
   single one-shot `herdr agent list` snapshot is fine; a `sleep`/loop never is.
-- **Tasks always run in the background.** `create` arms a detached, **re-arming**
-  watcher that fires on **every** settle of the executor: each time it goes idle
-  it **records a durable `settled` event to the ledger** (status
-  `awaiting-dispatch`, or `blocked`), fires a desktop notification, then wakes
-  Dispatch with a `[task-watcher]` self-prompt — retrying so a transient busy
-  state can't drop it. After firing it waits for the executor to resume work
-  before watching for the next settle, so a task that settles → resumes → settles
-  again reports its state each time (and one dropped wake can never leave you
-  permanently blind). Because every settle is recorded to the ledger, a lost wake
-  never loses the result: `bin/task-worktree list` still shows it, and you'll
-  catch it on the human's next turn. Do NOT ask the human whether to wait — let
-  them carry on; you'll be woken automatically.
+- **Tasks always run in the background, and they report to you.** There are two
+  paths, and both funnel through the same exactly-once gate, so you are woken
+  **exactly once per settle**:
+  1. **PRIMARY — the executor tells you.** Its contract makes
+     `bin/task-worktree done` its final action after committing/pushing. That
+     records a durable `settled` ledger event (with its note, PR/compare link and
+     full report at `reports/<id>.executor.md`), fires a desktop notification,
+     and wakes you with a `[task-executor]` prompt.
+  2. **BACKSTOP — the watcher.** `create` arms a detached, **re-arming**
+     `bin/task-worktree watch <id>` process for the case where the executor dies
+     or forgets. It waits on herdr for a settle and goes through the same path,
+     waking you with `[task-watcher]`. If the executor already self-reported, the
+     watcher is silently suppressed. If the watcher itself breaks it **fails
+     loud**: it logs to `.dispatch/logs/watch-<id>.log`, records a
+     `watcher-failed` settle, and wakes you — it never spins silently.
+  After a settle the claim is released as soon as the executor resumes work, so a
+  task that settles → is steered → settles again reports each time. Because every
+  settle is recorded to the ledger first, a lost wake never loses the result:
+  `bin/task-worktree list` still shows it, and you'll catch it on the human's
+  next turn. Do NOT ask the human whether to wait — let them carry on; you'll be
+  woken automatically.
+- **If the ledger looks wrong, reconcile it.** `bin/task-worktree reconcile`
+  (add `--dry-run` to look first) compares every open task against live herdr
+  agent state and repairs tasks stuck at `working` whose agent is actually idle
+  or blocked — routing them through the same exactly-once path. Cheap,
+  non-blocking, and safe to run whenever `list` smells stale.
 - When a wake arrives (or you spot an `awaiting-dispatch` task in `list`):
-  1. `herdr agent read <id>` to read the executor's final report **before the
-     agent workspace can be torn down** (once closed you can't read it again).
+  1. Read the executor's report. If it self-reported, the wake already carries
+     the summary and `reports/<id>.executor.md` holds the full text — no terminal
+     read needed. Otherwise `herdr agent read <id>` **before the agent workspace
+     can be torn down** (once closed you can't read it again).
   2. **Persist it with `bin/task-worktree report <id>`** — always via this command,
+     and prefer `--body-file reports/<id>.executor.md` when the executor
+     self-reported (its own words are already durable there),
      never by hand. It writes `reports/<id>.md` **first**, then a `reported` ledger
      event, so the report is durable before any teardown:
      ```

@@ -12,5 +12,7 @@
 !/bin/
 !/.dispatch/
 
-# Within .dispatch, the ledger is per-task state, not tooling.
+# Within .dispatch, the ledger and the runtime scratch are per-task state, not tooling.
 /.dispatch/ledger.jsonl
+/.dispatch/settle/
+/.dispatch/logs/

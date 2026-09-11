@@ -8,12 +8,25 @@
 # well-isolated so that extraction is easy.
 #
 # Subcommands:
-#   create   Create worktree(s) + ephemeral task dir + spawn an executor agent.
-#   handoff  Swap in a fresh-context executor on an existing worktree/branch.
-#   remove   Tear down a task: herdr worktrees, symlinks, task dir, ledger.
-#   prune    Garbage-collect dangling worktree symlinks + unused repo symlinks.
-#   list     Show current task status derived from the ledger.
-#   help     Show usage.
+#   create    Create worktree(s) + ephemeral task dir + spawn an executor agent.
+#   handoff   Swap in a fresh-context executor on an existing worktree/branch.
+#   done      Executor self-notification: "I am finished" (PRIMARY completion path).
+#   watch     Detached settle watcher for one task (BACKSTOP; armed by create).
+#   report    Persist an executor's report durably.
+#   reconcile Repair ledger status from live herdr agent state.
+#   remove    Tear down a task: herdr worktrees, symlinks, task dir, ledger.
+#   prune     Garbage-collect dangling worktree symlinks + unused repo symlinks.
+#   list      Show current task status derived from the ledger.
+#   help      Show usage.
+#
+# Completion is EXACTLY-ONCE per settle. Two independent paths converge on the
+# same code (`notify-settle`), which takes a per-task settle CLAIM before it
+# records/notifies/wakes:
+#   1. PRIMARY  — the executor calls `done` as its final action.
+#   2. BACKSTOP — the detached `watch` process sees the agent settle.
+# Whoever gets there first claims the settle; the other is suppressed. The claim
+# is released when the executor genuinely resumes work (re-arming), so a task
+# that settles -> is steered -> settles again reports every time.
 #
 set -euo pipefail
 
@@ -21,6 +34,7 @@ set -euo pipefail
 # Layout / config
 # ---------------------------------------------------------------------------
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"     # the Dispatch root
+SELF="$ROOT/bin/$(basename "${BASH_SOURCE[0]}")"            # re-invocable path
 REPOS="${TASK_REPOS_DIR:-$HOME/Repositories}"               # source repos
 WORKTREE_STORE="${TASK_WORKTREE_STORE:-$HOME/agentic-workspaces/.worktrees}"
 WORKTREE_VIEW="$ROOT/worktree"                             # symlink view
@@ -29,7 +43,12 @@ REPORTS_DIR="$ROOT/reports"                                 # durable task repor
 DISPATCH_DIR="$ROOT/.dispatch"
 LEDGER="$DISPATCH_DIR/ledger.jsonl"
 EXECUTOR_CONTEXT="$DISPATCH_DIR/task-executor.AGENTS.md"
+SETTLE_DIR="$DISPATCH_DIR/settle"                           # per-task settle claims
+LOG_DIR="$DISPATCH_DIR/logs"                                # watcher logs
 DEFAULT_AGENT_KIND="${TASK_AGENT_KIND:-pi}"
+
+SETTLE_EPOCH=""     # set by _settle_claim
+WATCH_LOG=""        # set by cmd_watch
 
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 info() { printf '· %s\n' "$*" >&2; }
@@ -39,7 +58,8 @@ have herdr   || die "herdr not found on PATH"
 have python3 || die "python3 not found on PATH"
 have git     || die "git not found on PATH"
 
-mkdir -p "$DISPATCH_DIR" "$WORKTREE_VIEW" "$TASKS_DIR" "$WORKTREE_STORE" "$REPORTS_DIR"
+mkdir -p "$DISPATCH_DIR" "$WORKTREE_VIEW" "$TASKS_DIR" "$WORKTREE_STORE" "$REPORTS_DIR" \
+         "$SETTLE_DIR" "$LOG_DIR"
 [ -f "$LEDGER" ] || : > "$LEDGER"
 
 # ---------------------------------------------------------------------------
@@ -101,8 +121,600 @@ _compare_url() {
 }
 
 # ---------------------------------------------------------------------------
+# herdr agent probes
+#
+# IMPORTANT (regression guard): `herdr agent wait --until <S>` takes ONE status
+# and must be REPEATED for several (`--until idle --until done`). A
+# space-separated list makes herdr exit rc=2 with "unknown option: <s>", which
+# silently turns every probe into "false" — exactly the bug that made the old
+# watcher spin forever without ever recording a settle. A BARE `herdr agent wait
+# <id>` already defaults to idle/done/blocked, so prefer it for settle waits.
+#
+# Exit codes we rely on (verified against live agents):
+#   0     the requested state was reached
+#   1     timeout / no match / agent_not_found  (a normal, expected outcome)
+#   >=2   bad invocation or herdr failure       (NEVER retry-loop on this)
+# ---------------------------------------------------------------------------
+
+HWAIT_ERR=""
+
+# _hwait <target> [herdr-wait-args...]
+#   rc 0  matched
+#   rc 1  no match / timed out (agent is alive, just not in that state)
+#   rc 2  FATAL: bad invocation, herdr failure, or the agent is gone.
+#         Callers MUST treat rc 2 as "stop", never as "try again".
+_hwait() {
+  local out rc=0
+  HWAIT_ERR=""
+  out="$(herdr agent wait "$@" 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] && return 0
+  if [ "$rc" -ge 2 ]; then
+    HWAIT_ERR="herdr agent wait rc=$rc: $out"
+    return 2
+  fi
+  case "$out" in
+    *agent_not_found*) HWAIT_ERR="agent not found: $out"; return 2 ;;
+  esac
+  return 1
+}
+
+# _agent_field <target> <field>  -> prints the field of the live agent record.
+# rc 1 if the agent does not exist. Fields: agent_status, state_change_seq, ...
+_agent_field() {
+  local out rc=0
+  out="$(herdr agent get "$1" 2>&1)" || rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  python3 - "$out" "$2" <<'PY'
+import json, sys
+try:
+    a = json.loads(sys.argv[1])["result"]["agent"]
+except Exception:
+    sys.exit(1)
+print(a.get(sys.argv[2], ""))
+PY
+}
+
+# _agent_status <target> -> idle|working|blocked|done|unknown, or "" if gone
+_agent_status() { _agent_field "$1" agent_status 2>/dev/null || true; }
+# _agent_seq <target> -> herdr's monotonic state_change_seq ("" if gone)
+_agent_seq()    { _agent_field "$1" state_change_seq 2>/dev/null || true; }
+
+# _discover_dispatch_pane -> pane id of the Dispatch agent (cwd == the root)
+_discover_dispatch_pane() {
+  local out
+  out="$(herdr agent list 2>/dev/null)" || return 0
+  python3 - "$out" "$ROOT" <<'PY'
+import json, sys
+try:
+    agents = json.loads(sys.argv[1])["result"]["agents"]
+except Exception:
+    sys.exit(0)
+root = sys.argv[2]
+for a in agents:
+    # the Dispatch agent is the one rooted AT the dispatch root (executors live
+    # in tasks/<id>/ subdirs and carry a task name)
+    if a.get("cwd") == root and not a.get("name"):
+        print(a.get("pane_id", "")); break
+PY
+}
+
+# _task_field <id> <key> -> a field from the task's latest created/handoff record
+_task_field() {
+  local rec; rec="$(_find_created_rec "$1")"
+  [ -n "$rec" ] || return 0
+  jget "$rec" "d.get('$2') or ''" 2>/dev/null || true
+}
+
+# _resolve_dispatch_pane <id> -> the pane to wake.
+# Deliberately does NOT consult $HERDR_PANE_ID: when an EXECUTOR runs `done`,
+# that variable points at the executor's own pane, which would wake the wrong
+# agent. Resolution order: explicit arg > task.env > ledger > live discovery.
+_resolve_dispatch_pane() {
+  local id="$1" explicit="${2:-}" p=""
+  [ -n "$explicit" ] && { printf '%s\n' "$explicit"; return 0; }
+  [ -n "${TASK_DISPATCH_PANE:-}" ] && { printf '%s\n' "$TASK_DISPATCH_PANE"; return 0; }
+  if [ -n "$id" ] && [ -f "$TASKS_DIR/$id/task.env" ]; then
+    p="$(. "$TASKS_DIR/$id/task.env" >/dev/null 2>&1; printf '%s' "${TASK_DISPATCH_PANE:-}")"
+    [ -n "$p" ] && { printf '%s\n' "$p"; return 0; }
+  fi
+  [ -n "$id" ] && p="$(_task_field "$id" dispatch_pane)"
+  [ -n "$p" ] && { printf '%s\n' "$p"; return 0; }
+  _discover_dispatch_pane
+}
+
+# ---------------------------------------------------------------------------
+# Settle claims — the exactly-once gate
+#
+# One claim file per task ($SETTLE_DIR/<id>.claim). Holding it means "this
+# settle has already been recorded and Dispatch has already been woken". It is
+# released when the executor genuinely resumes work, which is what makes the
+# re-arming behaviour (settle -> steer -> settle again) keep reporting.
+# ---------------------------------------------------------------------------
+
+# _settle_claim <id> <by> <force 0|1>
+#   rc 0  we own this settle -> caller must record + notify + wake
+#   rc 1  suppressed — this settle was already reported by someone else
+_settle_claim() {
+  local id="$1" by="$2" force="${3:-0}" seq verdict
+  seq="$(_agent_seq "$id")"
+  mkdir -p "$SETTLE_DIR"
+  verdict="$(python3 - "$SETTLE_DIR/$id.claim" "$SETTLE_DIR/$id.lock" "$by" "$seq" "$force" "$(now)" <<'PY'
+import json, os, shutil, sys, time
+
+claim_path, lock_path, by, seq, force, ts = sys.argv[1:7]
+force = force == "1"
+seq = int(seq) if seq.strip().isdigit() else None
+
+# --- tiny cross-process lock (mkdir is atomic on every POSIX fs) -------------
+for attempt in range(200):                       # ~10s worth of tries
+    try:
+        os.mkdir(lock_path); break
+    except FileExistsError:
+        try:                                     # break a lock left by a crash
+            if time.time() - os.path.getmtime(lock_path) > 30:
+                shutil.rmtree(lock_path, ignore_errors=True); continue
+        except OSError:
+            pass
+        time.sleep(0.05)
+else:
+    shutil.rmtree(lock_path, ignore_errors=True)
+    os.mkdir(lock_path)
+
+try:
+    claim = None
+    try:
+        with open(claim_path) as fh:
+            claim = json.load(fh)
+    except Exception:
+        claim = None
+
+    def fire(epoch):
+        with open(claim_path, "w") as fh:
+            json.dump({"epoch": epoch, "by": by, "seq": seq,
+                       "released": False, "ts": ts}, fh)
+        print("fire %d" % epoch)
+
+    if force or claim is None:
+        fire(int((claim or {}).get("epoch", 0)) + 1)
+    elif claim.get("released"):
+        # the executor resumed work since the last settle -> a genuinely NEW
+        # settle. This is what preserves re-arming.
+        fire(int(claim.get("epoch", 0)) + 1)
+    elif by == "watcher":
+        # BACKSTOP suppressed: the executor already self-reported this settle.
+        # Record the seq we actually observed the agent settle at, so a later
+        # executor-side call can tell "same settle" from "a new one".
+        claim["seq"] = seq if seq is not None else claim.get("seq")
+        claim["watcher_seen"] = True
+        with open(claim_path, "w") as fh:
+            json.dump(claim, fh)
+        print("skip %d" % int(claim.get("epoch", 0)))
+    else:
+        # Executor/reconcile side. If the monotonic state_change_seq from herdr has
+        # advanced past the claim, the agent changed state since it was taken
+        # (it was steered and worked again) -> a new settle. This keeps
+        # re-arming working even if the watcher died and never released.
+        prev = claim.get("seq")
+        if seq is not None and isinstance(prev, int) and seq > prev:
+            fire(int(claim.get("epoch", 0)) + 1)
+        else:
+            print("skip %d" % int(claim.get("epoch", 0)))
+finally:
+    shutil.rmtree(lock_path, ignore_errors=True)
+PY
+)"
+  SETTLE_EPOCH="${verdict#* }"
+  case "$verdict" in
+    fire*) return 0 ;;
+    *)     return 1 ;;
+  esac
+}
+
+# _settle_release <id> [reason] — mark the current claim released because the
+# executor resumed work, so the NEXT settle reports again (re-arming).
+_settle_release() {
+  # NOTE: separate statements on purpose — bash expands every word of a `local`
+  # command before assigning any of them, so `local a=$1 b=$a` would blow up.
+  local id="$1" reason="${2:-resumed}"
+  local claim="$SETTLE_DIR/$id.claim"
+  [ -f "$claim" ] || return 0
+  python3 - "$claim" <<'PY' || return 0
+import json, sys
+p = sys.argv[1]
+try:
+    with open(p) as fh: c = json.load(fh)
+except Exception:
+    sys.exit(0)
+if c.get("released"):
+    sys.exit(1)          # already released -> no duplicate 'resumed' event
+c["released"] = True
+with open(p, "w") as fh: json.dump(c, fh)
+PY
+  ledger_append "{\"event\":\"resumed\",\"id\":\"$id\",\"status\":\"working\",\"reason\":\"$reason\",\"ts\":\"$(now)\"}"
+}
+
+# _settle_forget <id> — drop all claim state (teardown).
+_settle_forget() {
+  rm -f  "$SETTLE_DIR/$1.claim" 2>/dev/null || true
+  rm -rf "$SETTLE_DIR/$1.lock"  2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# notify-settle — the ONE place a settle is recorded + announced.
+# Used by `done` (executor, primary), `watch` (backstop) and `reconcile`.
+# ---------------------------------------------------------------------------
+usage_notify_settle() {
+  cat >&2 <<EOF
+Usage: task-worktree notify-settle <task-id> --by <executor|watcher|reconcile>
+                            [--status <awaiting-dispatch|blocked|watcher-failed>]
+                            [--note <text>] [--pr <url>] [--commit <sha>]
+                            [--body <text> | --body-file <path>]
+                            [--dispatch-pane <pane>] [--compare <url>] [--force]
+
+  Internal plumbing: takes the settle claim, appends the durable 'settled'
+  ledger event, fires the desktop notification and wakes Dispatch — EXACTLY
+  ONCE per settle. Prefer 'done' (executors) over calling this directly.
+EOF
+}
+
+cmd_notify_settle() {
+  local id="" by="" status="awaiting-dispatch" note="" pr="" commit=""
+  local body="" body_file="" pane_arg="" compare="" force=0 quiet=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --by)            by="$2"; shift 2 ;;
+      --status)        status="$2"; shift 2 ;;
+      --note)          note="$2"; shift 2 ;;
+      --pr)            pr="$2"; shift 2 ;;
+      --commit)        commit="$2"; shift 2 ;;
+      --body)          body="$2"; shift 2 ;;
+      --body-file)     body_file="$2"; shift 2 ;;
+      --dispatch-pane) pane_arg="$2"; shift 2 ;;
+      --compare)       compare="$2"; shift 2 ;;
+      --force)         force=1; shift ;;
+      --quiet)         quiet=1; shift ;;
+      -h|--help)       usage_notify_settle; return 0 ;;
+      -*) die "notify-settle: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "notify-settle: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_notify_settle; die "notify-settle: task id required"; }
+  [ -n "$by" ] || die "notify-settle: --by required"
+
+  # 0. EXACTLY-ONCE GATE.
+  if ! _settle_claim "$id" "$by" "$force"; then
+    [ "$quiet" -eq 1 ] || info "settle already reported for $id (epoch ${SETTLE_EPOCH:-?}) — $by suppressed"
+    return 0
+  fi
+  local epoch="${SETTLE_EPOCH:-1}"
+
+  local mode branch primary
+  mode="$(_task_field "$id" mode)";    [ -n "$mode" ] || mode="code"
+  branch="$(_task_field "$id" branch)"
+  primary="$(_task_field "$id" primary_repo)"
+  if [ -z "$compare" ] && [ "$mode" = "code" ] && [ -n "$branch" ] && [ -n "$primary" ]; then
+    compare="$(_compare_url "$primary" "$branch" 2>/dev/null || true)"
+  fi
+
+  # 1. The executor's own words, persisted BEFORE any wake so they survive even
+  #    if every wake fails and the agent workspace is later torn down.
+  local exec_report=""
+  if [ -n "$body_file" ]; then
+    [ -f "$body_file" ] || die "notify-settle: --body-file not found: $body_file"
+    body="$(cat "$body_file")"
+  fi
+  if [ -n "$body" ]; then
+    mkdir -p "$REPORTS_DIR"
+    exec_report="$REPORTS_DIR/$id.executor.md"
+    {
+      printf '%s\n\n' "# Executor report: $id (settle #$epoch, by $by)"
+      [ -n "$note" ]    && printf '%s\n' "- **note:** $note"
+      [ -n "$pr" ]      && printf '%s\n' "- **pr:** $pr"
+      [ -n "$commit" ]  && printf '%s\n' "- **commit:** $commit"
+      [ -n "$compare" ] && printf '%s\n' "- **compare:** $compare"
+      printf '%s\n\n---\n\n' "- **ts:** $(now)"
+      printf '%s\n' "$body"
+    } > "$exec_report"
+  fi
+
+  # 2. DURABLE ledger event — append-only, survives any wake failure, and makes
+  #    `list` accurate with no live polling.
+  local entry
+  entry="$(python3 - "$id" "$status" "$by" "$epoch" "$note" "$pr" "$commit" \
+                    "${exec_report:+reports/$id.executor.md}" "$compare" "$(now)" <<'PY'
+import json, sys
+(id_, status, by, epoch, note, pr, commit, rf, compare, ts) = sys.argv[1:11]
+print(json.dumps({
+    "event": "settled", "id": id_, "status": status, "by": by,
+    "epoch": int(epoch) if str(epoch).isdigit() else None,
+    "note": note or None, "pr": pr or None, "commit": commit or None,
+    "executor_report": rf or None, "compare": compare or None, "ts": ts,
+}))
+PY
+)"
+  ledger_append "$entry"
+
+  # 3. Desktop notification for the human (covers the case where every wake fails).
+  herdr notification show "Task $id settled ($status)" \
+    --body "${note:-Recorded to ledger — Dispatch will report.}" >/dev/null 2>&1 || true
+
+  # 4. Wake Dispatch — retried so a transient busy state can't swallow it.
+  local pane; pane="$(_resolve_dispatch_pane "$id" "$pane_arg")"
+  if [ -z "$pane" ]; then
+    info "warning: could not resolve the Dispatch pane; settle is recorded in the ledger only"
+    return 0
+  fi
+  local msg
+  if [ "$by" = "executor" ]; then
+    msg="[task-executor] Task $id reports DONE (status: $status)."
+  else
+    msg="[task-$by] Executor $id settled ($status)."
+  fi
+  [ -n "$note" ]        && msg="$msg Note: $note"
+  [ -n "$pr" ]          && msg="$msg PR: $pr"
+  [ -n "$compare" ]     && msg="$msg Show the human this GitHub compare link: $compare"
+  [ -n "$commit" ]      && msg="$msg Commit: $commit"
+  [ -n "$exec_report" ] && msg="$msg Full executor report: reports/$id.executor.md"
+  msg="$msg Next: read it (herdr agent read $id) if you need more, then persist it with bin/task-worktree report $id --status awaiting-review --note \"<summary>\"${exec_report:+ --body-file reports/$id.executor.md}, and surface the result to the human."
+
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    herdr agent prompt "$pane" "$msg" >/dev/null 2>&1 && { 
+      [ "$quiet" -eq 1 ] || info "woke Dispatch ($pane) for $id settle #$epoch"
+      return 0
+    }
+    sleep 10
+  done
+  info "warning: could not wake Dispatch ($pane) after 5 attempts; settle #$epoch is still recorded in the ledger"
+}
+
+# ---------------------------------------------------------------------------
+# done — the executor's PRIMARY completion path
+# ---------------------------------------------------------------------------
+usage_done() {
+  cat >&2 <<EOF
+Usage: task-worktree done [<task-id>] --note "<one-line summary>"
+                          [--pr <url>] [--commit <sha>]
+                          [--body <text> | --body-file <path>]
+                          [--blocked] [--force]
+
+  Called BY THE EXECUTOR as its final action, after committing and pushing.
+  Records the durable settle event, notifies the human and wakes Dispatch.
+  Executors must NEVER call 'herdr agent prompt' by hand.
+
+  The task id defaults to \$TASK_ID, or to TASK_ID in ./task.env (which 'create'
+  writes into the task workspace), so plain 'task-worktree done --note ...'
+  works from inside a task dir.
+
+  --note      One-line summary (required) — what you did.
+  --pr        Pull-request URL, when the brief asked for a PR.
+  --commit    Head commit SHA of your branch.
+  --body[-file]  Your full markdown report; stored at reports/<id>.executor.md
+              so it survives teardown.
+  --blocked   You are stopping BLOCKED, not finished (status: blocked).
+  --force     Report again even if this settle was already reported.
+EOF
+}
+
+cmd_done() {
+  local id="" status="awaiting-dispatch"
+  local -a pass=()
+  local note_seen=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --note)      note_seen=1; pass+=(--note "$2"); shift 2 ;;
+      --pr|--commit|--body|--body-file|--dispatch-pane|--compare)
+                   pass+=("$1" "$2"); shift 2 ;;
+      --blocked)   status="blocked"; shift ;;
+      --force)     pass+=(--force); shift ;;
+      -h|--help)   usage_done; return 0 ;;
+      -*) die "done: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "done: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+
+  # Work out who we are without guessing: explicit arg > \$TASK_ID > ./task.env.
+  [ -n "$id" ] || id="${TASK_ID:-}"
+  if [ -z "$id" ] && [ -f "./task.env" ]; then
+    id="$(. ./task.env >/dev/null 2>&1; printf '%s' "${TASK_ID:-}")"
+  fi
+  [ -n "$id" ] || { usage_done; die "done: task id required (no \$TASK_ID and no ./task.env)"; }
+  [ "$note_seen" -eq 1 ] || { usage_done; die "done: --note is required"; }
+  [ -n "$(_find_created_rec "$id")" ] || die "done: no ledger record for task '$id'"
+
+  cmd_notify_settle "$id" --by executor --status "$status" ${pass[@]+"${pass[@]}"}
+}
+
+# ---------------------------------------------------------------------------
+# watch — the detached settle BACKSTOP (armed by create; runs as its own process)
+# ---------------------------------------------------------------------------
+usage_watch() {
+  cat >&2 <<EOF
+Usage: task-worktree watch <task-id> [--dispatch-pane <pane>] [--compare <url>]
+
+  Long-running BACKSTOP for one task. Waits for the executor to settle and
+  hands the settle to 'notify-settle', which de-duplicates against the
+  executor's own 'done'. Re-arms after every settle. Normally started detached
+  by 'create'; run it in the foreground to debug (logs to .dispatch/logs/).
+EOF
+}
+
+_watch_log() { printf '%s %s\n' "$(now)" "$*" >> "$WATCH_LOG"; }
+
+# _watch_abort <id> <reason> — fail LOUD: log it, tell the human, and record a
+# durable ledger event + wake so a broken watcher can never fail silently.
+_watch_abort() {
+  local id="$1" reason="$2"
+  _watch_log "ABORT: $reason"
+  herdr notification show "Task watcher FAILED ($id)" \
+    --body "$reason — see ${WATCH_LOG#$ROOT/}" >/dev/null 2>&1 || true
+  cmd_notify_settle "$id" --by watcher --status watcher-failed --force \
+    --note "watcher aborted: $reason (log: ${WATCH_LOG#$ROOT/}) — check this task's real state with bin/task-worktree reconcile" \
+    >/dev/null 2>&1 || true
+  exit 1
+}
+
+cmd_watch() {
+  local id="" pane="" compare=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dispatch-pane) pane="$2"; shift 2 ;;
+      --compare)       compare="$2"; shift 2 ;;
+      -h|--help)       usage_watch; return 0 ;;
+      -*) die "watch: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "watch: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_watch; die "watch: task id required"; }
+
+  mkdir -p "$LOG_DIR"
+  WATCH_LOG="$LOG_DIR/watch-$id.log"
+
+  # DEBOUNCE: seconds the executor must stay settled before we trust a settle.
+  # A freshly-booted agent momentarily reports idle/done BEFORE it starts
+  # working, so a single wait can latch onto that boot transient and fire a
+  # false settle. Two defences, both preserved from the debounce fix:
+  #   (1) require having WITNESSED a genuine working phase, and
+  #   (2) require the settle to persist across the debounce window.
+  # These sleeps live in this DETACHED process — they never block Dispatch.
+  local debounce="${TASK_WATCH_DEBOUNCE:-5}"
+  # SAFETY VALVE: the maximum number of inconclusive probes before we give up
+  # and fail loud. The old watcher could spin here forever, recording nothing.
+  local max_spins="${TASK_WATCH_MAX_SPINS:-120}"
+
+  _watch_log "watch start (pid $$, debounce=${debounce}s, max_spins=$max_spins, pane=${pane:-auto})"
+
+  local rc st spins n
+
+  # Phase 1 — WITNESS a genuine work phase (first cycle only). The boot
+  # transient can satisfy a bare "--until working" wait, so we additionally
+  # require a fresh probe to read the agent as actually working. If the agent
+  # never shows work across all attempts (a genuinely fast task that finished
+  # before we looked), fall through — phase 2's debounce still guards us.
+  local witnessed=0
+  for n in 1 2 3 4 5 6; do
+    rc=0; _hwait "$id" --until working --timeout 30000 || rc=$?
+    [ "$rc" -ge 2 ] && _watch_abort "$id" "$HWAIT_ERR"
+    if [ "$(_agent_status "$id")" = "working" ]; then witnessed=1; break; fi
+    sleep "$debounce"
+  done
+  _watch_log "phase 1 done: witnessed=$witnessed"
+
+  # RE-ARMING LOOP: report EVERY settle.
+  while :; do
+    # Phase 2 — wait for a settle that HOLDS across the debounce window.
+    # NOTE: a BARE wait already means idle|done|blocked. Never write
+    # '--until idle done blocked' — herdr exits rc=2 on that.
+    spins=0
+    while :; do
+      rc=0; _hwait "$id" || rc=$?
+      if [ "$rc" -ge 2 ]; then
+        # The agent vanishing is normal iff the task was torn down.
+        if [ ! -d "$TASKS_DIR/$id" ]; then
+          _watch_log "task dir gone — task closed; watcher exiting cleanly"; return 0
+        fi
+        _watch_abort "$id" "$HWAIT_ERR"
+      fi
+      sleep "$debounce"
+      st="$(_agent_status "$id")"
+      case "$st" in
+        idle|done|blocked) break ;;                     # a real, held settle
+        working) : ;;                                   # resumed mid-window
+        "") if [ ! -d "$TASKS_DIR/$id" ]; then
+              _watch_log "agent gone + task dir gone — exiting cleanly"; return 0
+            fi ;;
+      esac
+      spins=$((spins + 1))
+      [ "$spins" -gt "$max_spins" ] && \
+        _watch_abort "$id" "settle never stabilised after $max_spins probes (last status: '${st:-gone}')"
+      _watch_log "settle not held (status='${st:-gone}'), spin $spins/$max_spins"
+    done
+
+    local status="awaiting-dispatch"
+    [ "$st" = "blocked" ] && status="blocked"
+    _watch_log "settled: status=$status"
+
+    # Hand off to the shared path — it de-duplicates against the executor's
+    # own 'done', so Dispatch is woken exactly once for this settle.
+    cmd_notify_settle "$id" --by watcher --status "$status" --quiet \
+      ${pane:+--dispatch-pane "$pane"} ${compare:+--compare "$compare"} \
+      >>"$WATCH_LOG" 2>&1 || _watch_log "warning: notify-settle failed (see above)"
+
+    # RE-ARM: block until the executor genuinely resumes work, then release the
+    # settle claim so the NEXT settle reports again.
+    spins=0
+    while :; do
+      if [ "$(_agent_status "$id")" = "working" ]; then break; fi
+      rc=0; _hwait "$id" --until working || rc=$?
+      if [ "$rc" -ge 2 ]; then
+        if [ ! -d "$TASKS_DIR/$id" ]; then
+          _watch_log "task closed while parked; watcher exiting cleanly"; return 0
+        fi
+        _watch_abort "$id" "$HWAIT_ERR"
+      fi
+      sleep "$debounce"
+      spins=$((spins + 1))
+      # Nothing is pending here (the settle is already recorded), so we back off
+      # instead of aborting — but we never hot-spin.
+      if [ "$spins" -gt "$max_spins" ]; then
+        _watch_log "re-arm: no confirmed resume after $spins probes; backing off"
+        sleep 30
+      fi
+    done
+    witnessed=1
+    _settle_release "$id" "executor resumed work"
+    _watch_log "re-armed: executor resumed work"
+  done
+}
+
+# ---------------------------------------------------------------------------
 # create
 # ---------------------------------------------------------------------------
+
+# _resolve_repo <repo> -> ensures \$REPOS/<repo> resolves to a git repo,
+# creating the on-demand symlink when we can work out where it lives.
+# Dies with an EXACT fix-it command when we can't.
+_resolve_repo() {
+  local repo="$1" target=""
+  if [ -d "$REPOS/$repo/.git" ] || [ -e "$REPOS/$repo/.git" ]; then return 0; fi
+
+  # Candidates, best first:
+  #   1. the Dispatch root itself (this harness repo is usually linked in as
+  #      \$REPOS/<root-basename> -> the root; that link is easy to lose)
+  #   2. an existing repo-view symlink at the root
+  if [ "$repo" = "$(basename "$ROOT")" ] && [ -e "$ROOT/.git" ]; then
+    target="$ROOT"
+  elif [ -L "$ROOT/$repo" ]; then
+    local t; t="$(cd "$ROOT" && readlink "$repo")"
+    [ -e "$t/.git" ] && target="$t"
+  fi
+
+  if [ -n "$target" ]; then
+    [ -e "$REPOS/$repo" ] && rm -f "$REPOS/$repo"
+    ln -s "$target" "$REPOS/$repo"
+    info "restored missing repo link: $REPOS/$repo -> $target"
+    return 0
+  fi
+
+  die "repo '$repo' is not a git repo under $REPOS (missing: $REPOS/$repo).
+Fix it with ONE of:
+  ln -s /path/to/$repo $REPOS/$repo        # link an existing checkout
+  git -C $REPOS clone <remote-url> $repo   # or clone it
+Then re-run this command."
+}
+
+# _done_brief <id> <compare-url> -> the completion contract appended to every
+# executor briefing, so the executor always knows how to reach Dispatch.
+_done_brief() {
+  local id="$1" compare="${2:-}"
+  printf '%s' "Your task id is $id (also in ./task.env). When you are finished — after committing and pushing — your FINAL action MUST be to tell Dispatch yourself:
+  $SELF done $id --note \"<one-line summary>\" [--pr <url>] [--body-file <path-to-your-report.md>]
+(use --blocked instead of finishing if you are stopping blocked). Never run 'herdr agent prompt' by hand."
+  [ -n "$compare" ] && printf '%s' "
+Compare link for your branch: $compare"
+  printf '\n'
+}
+
 usage_create() {
   cat >&2 <<EOF
 Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
@@ -159,11 +771,10 @@ cmd_create() {
   local id="${slug}-$(nonce)"
   [ -n "$branch" ] || branch="$id"
 
-  # validate repos exist
+  # validate repos exist (restoring a lost on-demand link when we can)
   local repo
   for repo in "${repos[@]}"; do
-    [ -d "$REPOS/$repo/.git" ] || [ -e "$REPOS/$repo/.git" ] \
-      || die "repo '$repo' is not a git repo under $REPOS"
+    _resolve_repo "$repo"
   done
 
   info "task id: $id  branch: $branch  mode: $mode  repos: ${repos[*]}"
@@ -226,6 +837,29 @@ cmd_create() {
   # executor AGENTS.md into the task dir
   ln -sfn "$EXECUTOR_CONTEXT" "$task_dir/AGENTS.md"
 
+  # Dispatch's own pane: resolved ONCE, here, where $HERDR_PANE_ID legitimately
+  # belongs to Dispatch (it is running this command). It is then persisted into
+  # the task workspace + ledger so the executor's `done` never has to guess.
+  local dispatch_pane="${DISPATCH_PANE_ID:-${HERDR_PANE_ID:-}}"
+  [ -n "$dispatch_pane" ] || dispatch_pane="$(_discover_dispatch_pane)"
+  local task_compare=""
+  [ "$mode" = "code" ] && task_compare="$(_compare_url "$primary" "$branch" 2>/dev/null || true)"
+
+  # task.env — the executor's identity kit. Sourced by `task-worktree done`, and
+  # readable by the executor itself.
+  cat > "$task_dir/task.env" <<EOF
+# Identity of this task — written by 'task-worktree create'. Source it or read it.
+TASK_ID="$id"
+TASK_SLUG="$slug"
+TASK_MODE="$mode"
+TASK_BRANCH="$branch"
+TASK_PRIMARY_REPO="$primary"
+TASK_REPOS="${repos[*]}"
+TASK_DISPATCH_PANE="$dispatch_pane"
+TASK_COMPARE_URL="$task_compare"
+TASK_WORKTREE_BIN="$SELF"
+EOF
+
   # spawn executor agent in an isolated workspace rooted at the task dir
   local exec_wsid="" exec_pane=""
   if [ "$no_agent" -eq 0 ]; then
@@ -243,128 +877,50 @@ cmd_create() {
     if [ -n "$prompt" ]; then
       local full="$prompt
 
-Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch)."
+Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch).
+$(_done_brief "$id" "$task_compare")"
       herdr agent prompt "$id" "$full" >/dev/null 2>&1 \
         || info "warning: agent prompt submission failed; brief the agent manually"
     fi
 
-    # Background watcher: never blocks Dispatch. Waits for the executor to
-    # settle, records a DURABLE settle event to the ledger (so the result can
-    # never be lost even if every wake fails), pings the human with a desktop
-    # notification, then wakes Dispatch — retrying so a transient busy state
-    # doesn't drop the wake. The human can carry on the whole time; Dispatch
-    # reacts to the wake (or reads the ledger on its next turn). No polling.
-    local dispatch_pane="${DISPATCH_PANE_ID:-${HERDR_PANE_ID:-}}"
-    # Compare link (code tasks only) computed now so the settle wake can carry it
-    # — the executor "reaching" Dispatch on completion delivers the link to show.
-    local watch_compare=""
-    [ "$mode" = "code" ] && watch_compare="$(_compare_url "$primary" "$branch")"
-    nohup bash -c '
-      id="$1"; disp="$2"; ledger="$3"; compare="$4"
-      ts() { date -u +%Y-%m-%dT%H:%M:%SZ; }
-      # DEBOUNCE: seconds the executor must stay settled before we trust a
-      # settle. A freshly-booted agent momentarily reports idle/done BEFORE it
-      # actually starts working, so a single wait can latch onto that boot
-      # transient and fire a false settle. We defend two ways: (1) require
-      # having WITNESSED a genuine working phase, and (2) require the settle to
-      # persist across the debounce window (re-probe; if it went back to
-      # working, keep waiting). These are cheap short sleeps in the DETACHED
-      # watcher — they never block Dispatch.
-      debounce="${TASK_WATCH_DEBOUNCE:-5}"
-
-      # Short-timeout probes of the CURRENT agent state (no polling loop; each
-      # is a single bounded wait). is_working confirms the agent is genuinely
-      # in a work phase right now; is_settled confirms idle/done/blocked now.
-      is_working() { herdr agent wait "$id" --until working --timeout 500 >/dev/null 2>&1; }
-      is_settled() { herdr agent wait "$id" --until idle done blocked --timeout 500 >/dev/null 2>&1; }
-
-      # Phase 1 — WITNESS a genuine work phase (FIRST cycle only). The boot
-      # transient can satisfy a bare "--until working" wait, so we additionally
-      # require a fresh probe to read the agent as actually working. Retry
-      # (bounded) so a slow start or a boot-time idle/done can never masquerade
-      # as "already settled". If the agent never shows work across all attempts
-      # (a genuinely fast task that finished before we looked), fall through.
-      # After the first cycle the re-arm step below explicitly waits for a fresh
-      # working phase, so witnessing is inherent from then on.
-      witnessed=0
-      for _ in 1 2 3 4 5 6; do
-        herdr agent wait "$id" --until working --timeout 30000 >/dev/null 2>&1 || true
-        if is_working; then witnessed=1; break; fi
-        sleep "$debounce"
-      done
-
-      # RE-ARMING LOOP: report EVERY settle. After each settle we wake Dispatch
-      # with the current state, then wait for the executor to resume work before
-      # watching for the next settle. If it never resumes (task truly done) the
-      # re-arm wait blocks harmlessly in this DETACHED watcher forever — zero
-      # cost to Dispatch. This way each idle transition surfaces its state, and
-      # a single dropped wake can never leave Dispatch permanently blind.
-      while :; do
-        # Phase 2 — wait for a settle that HOLDS across the debounce window.
-        while :; do
-          herdr agent wait "$id" --until idle done blocked >/dev/null 2>&1 || true
-          sleep "$debounce"
-          # Resumed work during the window? Not a real settle — keep waiting.
-          if is_working; then continue; fi
-          # Once we have witnessed real work, insist the agent still reads as
-          # settled now (guards against a transient/transition read).
-          if [ "$witnessed" -eq 1 ] && ! is_settled; then continue; fi
-          break
-        done
-
-        # distinguish a blocked settle from a clean one (no polling; single probes)
-        if herdr agent wait "$id" --until blocked --timeout 500 >/dev/null 2>&1; then
-          status="blocked"
-        else
-          status="awaiting-dispatch"
-        fi
-        # 1. DURABLE record — append-only, survives any wake failure; makes
-        #    bin/task-worktree list accurate without live polling.
-        printf "%s\n" "{\"event\":\"settled\",\"id\":\"$id\",\"status\":\"$status\",\"ts\":\"$(ts)\"}" >> "$ledger"
-        # 2. notify the human (covers the window if every wake retry fails)
-        herdr notification show "Task $id settled ($status)" \
-          --body "Recorded to ledger — Dispatch will report." >/dev/null 2>&1 || true
-        # 3. wake Dispatch, retrying so a transient busy/blocked state can'"'"'t
-        #    silently swallow the wake.
-        if [ -n "$disp" ]; then
-          msg="[task-watcher] Executor $id settled ($status). Run bin/task-worktree list, inspect it (herdr agent read $id), reconcile the ledger, push the branch, then flip it to awaiting-review and surface the result to the human."
-          [ -n "$compare" ] && msg="$msg Show the human this GitHub compare link: $compare"
-          for attempt in 1 2 3 4 5; do
-            herdr agent prompt "$disp" "$msg" >/dev/null 2>&1 && break
-            sleep 10
-          done
-        fi
-
-        # RE-ARM: block until the executor genuinely resumes work, then loop to
-        # watch for the next settle. witnessed stays 1 (guards remain active).
-        until is_working; do
-          herdr agent wait "$id" --until working >/dev/null 2>&1 || true
-          sleep "$debounce"
-        done
-      done
-    ' _ "$id" "$dispatch_pane" "$LEDGER" "$watch_compare" >/dev/null 2>&1 &
+    # BACKSTOP watcher: a detached `task-worktree watch` process. It never
+    # blocks Dispatch and never polls Dispatch; it waits on herdr for the
+    # executor to settle and then goes through the SAME notify-settle path the
+    # executor's own `done` uses, so the two can't double-report. It lives in
+    # its own process (not an inline heredoc) so it can be run and tested
+    # directly: bin/task-worktree watch <id>.
+    nohup "$SELF" watch "$id" \
+      ${dispatch_pane:+--dispatch-pane "$dispatch_pane"} \
+      ${task_compare:+--compare "$task_compare"} \
+      >>"$LOG_DIR/watch-$id.log" 2>&1 &
     disown 2>/dev/null || true
-    info "watcher armed → record + notify + wake Dispatch (${dispatch_pane:-unknown}) on EVERY settle of $id"
+    info "backstop watcher armed for $id (log: .dispatch/logs/watch-$id.log); primary path is the executor's own 'done'"
   fi
+
 
   # ledger entry
   local wts; wts="$(IFS=,; echo "${wt_records[*]}")"
   local entry
   entry="$(python3 - "$id" "$slug" "$branch" "$primary" "$agent" \
-                    "$request" "$prompt" "$exec_wsid" "$mode" "$(now)" "$wts" <<'PY'
+                    "$request" "$prompt" "$exec_wsid" "$mode" "$(now)" "$wts" \
+                    "$dispatch_pane" "$task_compare" <<'PY'
 import json, sys
-(id_, slug, branch, primary, agent, request, prompt, exec_ws, mode, ts, wts) = sys.argv[1:12]
+(id_, slug, branch, primary, agent, request, prompt, exec_ws, mode, ts, wts,
+ pane, compare) = sys.argv[1:14]
 print(json.dumps({
     "event": "created",
     "id": id_, "slug": slug, "branch": branch, "primary_repo": primary,
     "agent_kind": agent, "mode": mode, "request": request, "prompt": prompt,
     "executor_workspace_id": exec_ws or None,
+    "dispatch_pane": pane or None, "compare": compare or None,
     "worktrees": json.loads("[" + wts + "]"),
     "status": "working", "ts": ts,
 }))
 PY
 )"
   ledger_append "$entry"
+  # A fresh task is a fresh settle epoch.
+  _settle_forget "$id"
 
   printf '\n✔ task %s ready\n  task dir: %s\n' "$id" "$task_dir" >&2
   echo "$id"
@@ -410,6 +966,11 @@ PY
 # auto-close. Callers must persist any report BEFORE invoking this.
 _teardown_from_rec() {
   local rec="$1" delete_branch="$2" id="$3"
+
+  # Stop the backstop watcher first so it can't fire on the agent disappearing.
+  pkill -f "task-worktree watch $id" >/dev/null 2>&1 \
+    && info "stopped backstop watcher for $id" || true
+  _settle_forget "$id"
 
   python3 - "$rec" <<'PY' | while IFS=$'\t' read -r wsid repo branch path; do
 import json, sys
@@ -547,11 +1108,30 @@ cmd_handoff() {
 --- handoff note ---
 $note
 --- end handoff note ---"
+  local ho_compare=""
+  [ "$mode" = "code" ] && [ -n "$primary" ] && [ -n "$branch" ] \
+    && ho_compare="$(_compare_url "$primary" "$branch" 2>/dev/null || true)"
   full="$full
 
-Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch)."
+Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch).
+$(_done_brief "$id" "$ho_compare")"
   herdr agent prompt "$id" "$full" >/dev/null 2>&1 \
     || info "warning: agent prompt submission failed; brief the agent manually"
+
+  # A fresh executor means fresh work: release the settle claim so its eventual
+  # settle reports again (and refresh task.env, whose pane/branch may be stale).
+  _settle_release "$id" "handed off to a fresh executor"
+  if [ -f "$task_dir/task.env" ]; then
+    local ho_pane; ho_pane="$(_resolve_dispatch_pane "$id")"
+    python3 - "$task_dir/task.env" "$ho_pane" <<'PY' || true
+import re, sys
+p, pane = sys.argv[1], sys.argv[2]
+if pane:
+    s = open(p).read()
+    s = re.sub(r'^TASK_DISPATCH_PANE=.*$', 'TASK_DISPATCH_PANE="%s"' % pane, s, flags=re.M)
+    open(p, "w").write(s)
+PY
+  fi
 
   # 4. Ledger 'handoff' event — copies the task's worktrees/branch/mode from the
   #    prior record but records the NEW executor_workspace_id so teardown/report
@@ -688,6 +1268,109 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# reconcile — repair ledger status from LIVE herdr state
+# ---------------------------------------------------------------------------
+usage_reconcile() {
+  cat >&2 <<EOF
+Usage: task-worktree reconcile [<task-id> ...] [--dry-run] [--no-wake]
+
+  The ledger is the record of intent; herdr is authoritative for liveness. If a
+  settle was ever missed (a dead watcher, a crashed executor), a task can sit at
+  'working' in the ledger while its agent is actually idle. reconcile compares
+  the two and repairs the ledger.
+
+  An idle/blocked agent whose task still reads 'working' is put through the
+  normal notify-settle path, so it is recorded and Dispatch is woken — still
+  exactly once, because it takes the same settle claim.
+
+  --dry-run  Report what would change; touch nothing.
+  --no-wake  Record the repair in the ledger but do not wake Dispatch.
+EOF
+}
+
+cmd_reconcile() {
+  local dry=0 wake=1
+  local -a want=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      --no-wake) wake=0; shift ;;
+      -h|--help) usage_reconcile; return 0 ;;
+      -*) die "reconcile: unknown arg '$1'" ;;
+      *) want+=("$1"); shift ;;
+    esac
+  done
+
+  # Open tasks (anything not closed) and their last known ledger status.
+  local open_tasks
+  open_tasks="$(python3 - "$LEDGER" <<'PY'
+import json, sys
+state, order = {}, []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line: continue
+    try: o = json.loads(line)
+    except Exception: continue
+    tid = o.get("id")
+    if not tid: continue
+    if tid not in state: order.append(tid)
+    state.setdefault(tid, {}).update(o)
+for tid in order:
+    if state[tid].get("status") != "closed":
+        print("%s\t%s" % (tid, state[tid].get("status", "?")))
+PY
+)"
+
+  local changed=0 tid ledger_status live
+  while IFS=$'\t' read -r tid ledger_status; do
+    [ -n "$tid" ] || continue
+    if [ "${#want[@]}" -gt 0 ]; then
+      local hit=0 w
+      for w in "${want[@]}"; do [ "$w" = "$tid" ] && hit=1; done
+      [ "$hit" -eq 1 ] || continue
+    fi
+
+    live="$(_agent_status "$tid")"
+    case "${live:-gone}" in
+      working)
+        printf '  %-34s ledger=%-16s live=working        ok\n' "$tid" "$ledger_status" ;;
+      idle|done|blocked)
+        if [ "$ledger_status" = "working" ]; then
+          local new="awaiting-dispatch"
+          [ "$live" = "blocked" ] && new="blocked"
+          printf '  %-34s ledger=%-16s live=%-12s REPAIR -> %s\n' \
+            "$tid" "$ledger_status" "$live" "$new"
+          if [ "$dry" -eq 0 ]; then
+            changed=1
+            if [ "$wake" -eq 1 ]; then
+              cmd_notify_settle "$tid" --by reconcile --status "$new" \
+                --note "reconciled: agent was '$live' while the ledger still said 'working' (a settle was missed)"
+            else
+              ledger_append "{\"event\":\"settled\",\"id\":\"$tid\",\"status\":\"$new\",\"by\":\"reconcile\",\"note\":\"reconciled (no wake)\",\"ts\":\"$(now)\"}"
+            fi
+          fi
+        else
+          printf '  %-34s ledger=%-16s live=%-12s ok\n' "$tid" "$ledger_status" "$live"
+        fi ;;
+      gone|unknown|"")
+        printf '  %-34s ledger=%-16s live=%-12s NO AGENT\n' "$tid" "$ledger_status" "${live:-gone}"
+        if [ "$dry" -eq 0 ] && [ "$ledger_status" = "working" ]; then
+          changed=1
+          ledger_append "{\"event\":\"reconciled\",\"id\":\"$tid\",\"status\":\"orphaned\",\"note\":\"no live herdr agent; the executor is gone\",\"ts\":\"$(now)\"}"
+        fi ;;
+    esac
+  done <<< "$open_tasks"
+
+  if [ "$dry" -eq 1 ]; then
+    info "reconcile: dry run — nothing written"
+  elif [ "$changed" -eq 1 ]; then
+    info "reconcile: ledger repaired"
+  else
+    info "reconcile: ledger already matches herdr"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # prune
 # ---------------------------------------------------------------------------
 # Remove dangling worktree-view symlinks (target gone) and unused repo symlinks.
@@ -762,14 +1445,17 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|handoff|report|remove|prune|list|help> [args]
+Usage: task-worktree <create|handoff|done|report|reconcile|remove|prune|list|help> [args]
 
-  create   Spin a task: worktree(s) + ephemeral task dir + executor agent.
-  handoff  Baton-pass a task to a FRESH-context executor (same worktree/branch).
-  report   Persist an executor's report durably; auto-close if --mode investigate.
-  remove   Close a task and clean up (keeps the branch by default).
-  prune    Reconcile: drop dangling worktree symlinks + unused repo links.
-  list     Show task status from the ledger.
+  create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
+  handoff   Baton-pass a task to a FRESH-context executor (same worktree/branch).
+  done      (EXECUTORS) "I am finished" — record + notify + wake Dispatch.
+  watch     Detached settle backstop for one task (armed automatically).
+  report    Persist an executor's report durably; auto-close if --mode investigate.
+  reconcile Repair ledger status from live herdr agent state.
+  remove    Close a task and clean up (keeps the branch by default).
+  prune     Reconcile: drop dangling worktree symlinks + unused repo links.
+  list      Show task status from the ledger.
 
 Run 'task-worktree <cmd> --help' for details.
 EOF
@@ -780,7 +1466,15 @@ main() {
   case "$cmd" in
     create) cmd_create "$@" ;;
     handoff) cmd_handoff "$@" ;;
+    done)   cmd_done "$@" ;;
+    watch)  cmd_watch "$@" ;;
+    notify-settle) cmd_notify_settle "$@" ;;
+    # plumbing, used by the watcher and the selftest
+    _release) _settle_release "$@" ;;
+    _forget)  _settle_forget "$@" ;;
+    _status)  _agent_status "$@" ;;
     report) cmd_report "$@" ;;
+    reconcile) cmd_reconcile "$@" ;;
     remove) cmd_remove "$@" ;;
     prune)  cmd_prune "$@" ;;
     list)   cmd_list "$@" ;;

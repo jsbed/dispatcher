@@ -1,8 +1,30 @@
 # Task executor context
 
 You were spawned by **Dispatch** to carry out one task. Your working directory is
-an isolated `tasks/<id>/` dir containing symlinks to your git worktree(s) and this
-file. Stay inside your lane.
+an isolated `tasks/<id>/` dir containing symlinks to your git worktree(s), this
+file, and `task.env` (your identity: task id, branch, compare URL, and the path
+to the blessed `task-worktree` command). Stay inside your lane.
+
+## You report to Dispatch yourself
+
+Dispatch does **not** poll you. When you finish, **you tell it** — that is the
+primary completion path, and it is a hard requirement of this contract:
+
+```
+"$TASK_WORKTREE_BIN" done --note "<one-line summary>" \
+    [--pr <url>] [--commit <sha>] [--body-file <path-to-your-report.md>]
+```
+
+- Run it **from your task dir** (it reads `./task.env`), or pass your task id
+  explicitly: `task-worktree done <task-id> --note "..."`.
+- It records the durable ledger event, notifies the human, and wakes Dispatch —
+  **exactly once**. A background watcher is only a backstop for the case where
+  you die before calling it; the two never double-report.
+- **Never run `herdr agent prompt` (or any other `herdr` command) by hand.**
+  `task-worktree` is the only sanctioned way to reach Dispatch.
+- Stopping blocked instead of finished? Same command with `--blocked`.
+- Calling it again after Dispatch steers you and you do more work is correct and
+  expected — report every time you finish a round of work.
 
 ## Rules
 
@@ -18,16 +40,21 @@ file. Stay inside your lane.
    pushing it to the remote are the default — push when your work is ready so the
    branch is available for review. **Do not open pull requests** unless your task
    brief explicitly asks you to.
-5. **Finish cleanly.** When done, make sure your changes are committed and pushed,
-   then stop (go idle) with a short summary of what you did and how to verify it.
-   Dispatch watches your state and will flip you to `awaiting-review`.
+5. **Finish cleanly, and say so.** Your **final action**, in this order:
+   1. commit and push your branch (and open a PR only if the brief asked for one);
+   2. run `task-worktree done --note "..."` (see above) with your final report —
+      include the **PR URL** via `--pr` when you opened one, and your full
+      markdown report via `--body-file` so it survives teardown;
+   3. then stop (go idle) with the same summary in your terminal.
    **Always include a GitHub compare link** for your branch against its base
-   (`https://github.com/<org>/<repo>/compare/<base>...<your-branch>`, base is
-   usually `main`) in your final summary so Dispatch can hand it straight to the
-   human for review.
+   (`$TASK_COMPARE_URL` in `task.env`, or
+   `https://github.com/<org>/<repo>/compare/<base>...<your-branch>`) in your
+   summary so Dispatch can hand it straight to the human for review.
 6. **Report blockers early.** If you're blocked (missing info, failing setup,
-   ambiguous requirements, needing a decision), stop and state the blocker clearly
-   rather than guessing or expanding scope.
+   ambiguous requirements, needing a decision), stop and say so clearly rather
+   than guessing or expanding scope — and report it with
+   `task-worktree done --blocked --note "<what you need>"` so Dispatch hears it
+   immediately instead of waiting on a watcher.
 
 ## Scope discipline
 
