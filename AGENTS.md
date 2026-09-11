@@ -78,8 +78,12 @@ bin/task-worktree           this blessed script
 
 - **herdr is authoritative** for worktree/agent liveness. The ledger records the
   *intent* herdr doesn't store (the human request, branch, status history).
-- This root is a **scratch dir** (not git-tracked). The reusable version graduates
-  into its own repo/skill later.
+- This root is **git-tracked** in its own repo (`jsbed/dispatcher`). Only the
+  harness *tooling* is versioned there: `README.md`, `AGENTS.md`, `bin/`, and
+  `.dispatch/` (the executor contract). Everything else is ephemeral task state
+  and gitignored — `tasks/`, `worktree/`, `reports/`, the on-demand repo
+  symlinks, and `.dispatch/ledger.jsonl`. The reusable version graduates into
+  its own skill later.
 
 ## Tracking and reporting
 
