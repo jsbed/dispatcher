@@ -30,7 +30,34 @@ set -uo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/task-worktree"
 VERBOSE=0
-[ "${1:-}" = "-v" ] && VERBOSE=1
+FALSIFY=0
+FALSIFY_KEEP_DEBOUNCE=0
+# Section-level concurrency. Sections are fully independent (own sandbox, own
+# stub state, own watcher pids), and they are dominated by WAITING rather than
+# by CPU, so running them concurrently is close to free. Capped rather than
+# unbounded: the negative assertions are timing-sensitive, and a machine that
+# is oversubscribed makes a BROKEN watcher look slow, which is precisely the
+# way a dwell goes vacuous.
+JOBS="${TASK_SELFTEST_JOBS:-6}"
+for arg in "$@"; do
+  case "$arg" in
+    -v) VERBOSE=1 ;;
+    -j) printf -- '-j takes an attached value, e.g. -j4\n' >&2; exit 2 ;;
+    -j*) JOBS="${arg#-j}" ;;
+    --falsify) FALSIFY=1 ;;
+    --falsify-witness) FALSIFY=1; FALSIFY_KEEP_DEBOUNCE=1 ;;
+    -h|--help)
+      printf 'usage: task-worktree-selftest [-v] [-jN] [--falsify]\n'
+      printf '  -v         verbose notes\n'
+      printf '  -jN        run N sections concurrently (default %s; -j1 = serial)\n' "$JOBS"
+      printf '  --falsify  disable the watcher boot-transient defences and assert\n'
+      printf '             the suite CATCHES it (proves the dwells are not vacuous)\n'
+      printf '  --falsify-witness  as --falsify but leaves the debounce hold in\n'
+      printf '             place — a SLOWER false settle, i.e. the harder case\n'
+      exit 0 ;;
+    *) printf 'unknown arg: %s\n' "$arg" >&2; exit 2 ;;
+  esac
+done
 
 PASS=0; FAIL=0
 ok()   { PASS=$((PASS+1)); printf '  \033[32mok\033[0m   %s\n' "$1"; }
@@ -38,8 +65,22 @@ bad()  { FAIL=$((FAIL+1)); printf '  \033[31mFAIL\033[0m %s\n' "$1"; [ -n "${2:-
 is()   { if [ "$2" = "$3" ]; then ok "$1"; else bad "$1" "expected '$3', got '$2'"; fi; }
 note() { [ "$VERBOSE" -eq 1 ] && printf '       · %s\n' "$*"; return 0; }
 
+# ---------------------------------------------------------------------------
+# timing instrumentation — a per-section wall-clock breakdown, so "the suite is
+# slow" is always a measurement rather than a guess. Costs one perl spawn per
+# section (~15ms total across the run).
+# ---------------------------------------------------------------------------
+if command -v perl >/dev/null 2>&1; then
+  _ms() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time()*1000'; }
+else
+  _ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
+fi
+RUN_T0="$(_ms)"
+section() { printf '\n\033[1m%s\033[0m\n' "$1"; }
+
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/tw-selftest.XXXXXX")"
-trap 'pkill -f "$TMPROOT" >/dev/null 2>&1; rm -rf "$TMPROOT"' EXIT
+# TASK_SELFTEST_KEEP=1 leaves the sandboxes behind for post-mortem inspection.
+trap 'pkill -f "$TMPROOT" >/dev/null 2>&1; [ "${TASK_SELFTEST_KEEP:-0}" = 1 ] && printf "\nsandboxes kept: %s\n" "$TMPROOT" || rm -rf "$TMPROOT"' EXIT
 
 # ---------------------------------------------------------------------------
 # the fake herdr
@@ -93,6 +134,11 @@ agent)
     done
     [ -n "$want" ] || want=" idle done blocked"          # bare wait default
     deadline_ms="${timeout:-${HERDR_STUB_MAXWAIT_MS:-20000}}"
+    # Poll granularity. This is the stub's own latency floor: every state
+    # transition the watcher reacts to costs up to one tick, so it is a knob
+    # rather than a hardcoded 100ms.
+    poll_ms="${HERDR_STUB_POLL_MS:-100}"
+    poll_s="$(awk -v m="$poll_ms" 'BEGIN{printf "%.3f", m/1000}')"
     waited=0
     while :; do
       st="$(read_state "$target")" || { echo '{"error":{"code":"agent_not_found"}}'; exit 1; }
@@ -101,7 +147,7 @@ agent)
         [ "$w" = "$1" ] && { printf '{"result":{"agent":{"agent_status":"%s"}}}\n' "$1"; exit 0; }
       done
       [ "$waited" -ge "$deadline_ms" ] && { echo '{"error":{"code":"timeout"}}'; exit 1; }
-      sleep 0.1; waited=$((waited + 100))
+      sleep "$poll_s"; waited=$((waited + poll_ms))
     done
     ;;
   prompt) printf 'PROMPT\t%s\t%s\n' "${1:-}" "${2:-}" >> "$LOG"; echo '{"result":{}}' ;;
@@ -116,13 +162,121 @@ STUB
 chmod +x "$STUB_BIN/herdr"
 
 export PATH="$STUB_BIN:$PATH"
+# Defaults, so a probe made before the first setup() still works. Every case
+# overrides these with its OWN sandbox-scoped pair (see setup()).
 export HERDR_STUB_STATE="$TMPROOT/state"
 export HERDR_STUB_LOG="$TMPROOT/herdr.log"
-export TASK_WATCH_DEBOUNCE=1
+mkdir -p "$HERDR_STUB_STATE"; : > "$HERDR_STUB_LOG"
+CASE_SEQ=0
+CASE_PREFIX="x"          # set per section by the runner; keeps sandboxes unique
+
+# ---------------------------------------------------------------------------
+# TEST-ONLY TIMING. Every one of these is an env knob on the PRODUCTION code
+# whose default is unchanged; we only drive the watcher faster here. Nothing
+# below weakens an assertion — the watcher still performs every debounce,
+# witness and re-probe step, just on a millisecond clock instead of a
+# multi-second one.
+# ---------------------------------------------------------------------------
+export HERDR_STUB_POLL_MS=20          # stub's state-file poll granularity
 export HERDR_STUB_MAXWAIT_MS=4000
-# keep the watcher's bounded re-probe waits short so the suite stays quick
-export TASK_WATCH_PROBE_TIMEOUT_MS=3000
-export TASK_WATCH_RESUME_TIMEOUT_MS=3000
+export TASK_WATCH_DEBOUNCE=0.15       # prod default 5s
+export TASK_WATCH_WITNESS_TRIES=3           # prod default 6
+export TASK_WATCH_PROBE_TIMEOUT_MS=500      # prod default 60000
+export TASK_WATCH_RESUME_TIMEOUT_MS=300     # prod default 30000
+export TASK_WATCH_WITNESS_TIMEOUT_MS=2000   # prod default 30000
+export TASK_WATCH_REARM_BACKOFF_S=1         # prod default 30
+export TASK_WAKE_RETRY_SLEEP_S=0.1          # prod default 10
+# The re-probe waits above are short, so a legitimately long 'working' phase
+# burns spins much faster than in production. Raise the safety valve to match,
+# so no test can trip a FALSE abort. (Section 9 still proves the loud-failure
+# path via the agent-vanished route, which is spin-independent.)
+export TASK_WATCH_MAX_SPINS=10000
+
+# ---------------------------------------------------------------------------
+# CONDITION WAITS — the reason this suite is seconds rather than minutes.
+#
+# A fixed `sleep N` has to be the WORST case, so every case pays worst case
+# every run. A condition wait pays the ACTUAL latency and only falls back to a
+# generous timeout when something is broken (in which case the assertion after
+# it fails, exactly as before).
+#
+# wait_until <shell-predicate> [timeout_s]  -> rc 0 as soon as it holds
+# ---------------------------------------------------------------------------
+WAIT_TIMEOUT_S="${WAIT_TIMEOUT_S:-15}"     # generous: only reached when BROKEN
+WAIT_POLL_S=0.025
+wait_until() {
+  local pred="$1" timeout="${2:-$WAIT_TIMEOUT_S}" i=0 max
+  max="$(awk -v t="$timeout" 'BEGIN{printf "%d", t/0.025}')"
+  while [ "$i" -lt "$max" ]; do
+    if eval "$pred" >/dev/null 2>&1; then return 0; fi
+    sleep "$WAIT_POLL_S"; i=$((i + 1))
+  done
+  note "wait_until TIMED OUT after ${timeout}s: $pred"
+  return 1
+}
+wait_settles() { wait_until "[ \"\$(settles)\" -ge $1 ]" "${2:-}"; }
+wait_pauses()  { wait_until "[ \"\$(pauses)\" -ge $1 ]"  "${2:-}"; }
+wait_gone()    { wait_until "! kill -0 $1 2>/dev/null"   "${2:-}"; }
+
+# ---------------------------------------------------------------------------
+# DWELL — the one thing a condition wait CANNOT express.
+#
+# A NEGATIVE assertion ("no settle is recorded during the boot transient")
+# is only meaningful if we genuinely gave the watcher long enough to get it
+# wrong. There is no event to wait for, so these need real elapsed time — and
+# this is the single tunable that governs all of them.
+#
+# How long is long enough? This is MEASURED, not guessed, via --falsify below.
+# The measured dwell at which a broken watcher stops being detected:
+#
+#            bug variant                       serial (-j1)   concurrent (-j6)
+#   both guards off (the real pre-fix bug)         0.35s            <1.5s
+#   witness guard off, debounce kept (slowest)     0.8-1.0s         1.5-2.0s
+#
+# Concurrency matters because an oversubscribed machine makes the BROKEN
+# watcher slower too, which is the one way a dwell silently goes vacuous. The
+# default below is sized against the worst measured case (2.0s at the default
+# concurrency), with ~25% headroom on top.
+#
+# None of this is assumed — it is re-provable at any time:
+#   bin/task-worktree-selftest --falsify          # both guards off
+#   bin/task-worktree-selftest --falsify-witness  # the slowest variant
+# Both must report FALSIFICATION OK. If they do not, this dwell is too short
+# and section 5's negative assertions no longer detect the bug they exist for.
+# ---------------------------------------------------------------------------
+DWELL="${TASK_SELFTEST_DWELL:-2.5}"
+dwell() { sleep "$DWELL"; }
+
+# ---------------------------------------------------------------------------
+# FALSIFICATION MODE — proof that the dwell above is still long enough.
+#
+#   bin/task-worktree-selftest --falsify
+#
+# disables the watcher's TWO boot-transient defences (the witnessed-work-phase
+# wait and the debounce hold) — i.e. it restores exactly the pre-fix watcher
+# that fired a false settle off the boot transient. SECTION 5 MUST then FAIL.
+# If it passes, the dwell has become too short and its negative assertions are
+# vacuous, so this mode INVERTS its exit code: rc 0 means "the suite correctly
+# detected the broken watcher".
+#
+# Both defences are plain env knobs on the production code, so nothing has to
+# be monkey-patched: turning them off IS the bug.
+#
+# (Section 18 deliberately survives falsify mode and that is CORRECT, not
+# vacuous: its boot transient is a human-interrupt, so the classifier suppresses
+# the false settle even with the debounce gone. Section 18 guards the
+# classifier; section 5 guards the debounce. Different bug, different test.)
+# ---------------------------------------------------------------------------
+if [ "$FALSIFY" -eq 1 ]; then
+  export TASK_WATCH_WITNESS_TIMEOUT_MS=0      # never witness a work phase
+  if [ "$FALSIFY_KEEP_DEBOUNCE" -eq 0 ]; then
+    export TASK_WATCH_DEBOUNCE=0              # never require the settle to hold
+    printf '\n\033[33mFALSIFY MODE: boot-transient defences DISABLED.\033[0m\n'
+  else
+    printf '\n\033[33mFALSIFY MODE (witness only): debounce KEPT — the SLOWEST false settle.\033[0m\n'
+  fi
+  printf '\033[33msection 5 MUST fail (dwell=%ss); rc 0 == it did.\033[0m\n' "$DWELL"
+fi
 
 AID="demo-task-abc"
 
@@ -131,11 +285,24 @@ AID="demo-task-abc"
 # ---------------------------------------------------------------------------
 SANDBOX=""
 setup() {
-  pkill -f "$TMPROOT.*watch" >/dev/null 2>&1; sleep 0.3
-  SANDBOX="$TMPROOT/run$RANDOM$RANDOM"
+  # Kill any watcher this suite started, by EXACT pid, and reap it. The old
+  # `pkill -f "$TMPROOT.*watch"; sleep 0.3` was a blind broadcast followed by a
+  # hopeful wait; tracking pids lets us wait for the real thing and costs ~0ms.
+  stop_watchers
+  # NOTE: $$ is the PARENT's pid inside a bash 3.2 subshell, so it is useless
+  # for uniqueness here — CASE_PREFIX (the section id) is what actually keeps
+  # concurrent sections apart.
+  SANDBOX="$TMPROOT/run-$CASE_PREFIX-$((CASE_SEQ = CASE_SEQ + 1))"
+  # Per-CASE stub state and log, derived from the sandbox. Previously both were
+  # process-global and merely wiped between cases, so a watcher that outlived
+  # its case silently polluted the NEXT case's wake/settle counts (exactly the
+  # failure mode that the pkill-and-sleep in here was papering over). Scoping
+  # them per case removes the coupling entirely — and makes cases independent
+  # enough to run concurrently.
+  export HERDR_STUB_STATE="$SANDBOX/state"
+  export HERDR_STUB_LOG="$SANDBOX/herdr.log"
   mkdir -p "$SANDBOX/bin" "$SANDBOX/tasks/$AID" "$HERDR_STUB_STATE"
   cp "$SRC" "$SANDBOX/bin/task-worktree"
-  rm -f "$HERDR_STUB_STATE"/* "$HERDR_STUB_LOG"
   : > "$HERDR_STUB_LOG"
   mkdir -p "$SANDBOX/.dispatch"
   # the fake agent's cwd + its own private pi session store
@@ -182,9 +349,45 @@ pi_session() {
 no_pi_session() { rm -rf "$TASK_PI_SESSIONS_DIR"; }
 cause() { TW classify "$AID" | cut -f1; }
 pauses() { grep -c '"event": *"paused"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
-# Kill any watcher left over from a previous case. The pattern is scoped to this
-# test run's temp dir, so it can never touch a real watcher.
-stop_watchers() { pkill -f "$TMPROOT.*watch" >/dev/null 2>&1; sleep 0.5; return 0; }
+# ---------------------------------------------------------------------------
+# live watcher lifecycle
+#
+# Watchers are tracked by pid so they can be killed EXACTLY and reaped with
+# `wait` (instant and deterministic) rather than pkill-and-hope. The scoped
+# pkill survives only as an EXIT-trap backstop for stray stub children; it is
+# never on the per-case critical path.
+# ---------------------------------------------------------------------------
+WATCHER_PIDS=""
+WPID=""
+start_watcher() {
+  # Invoke the BINARY directly, not the TW function and not a subshell: `f &`
+  # and `( ... ) &` both make $! a wrapper shell, so `kill $!` reaps the wrapper
+  # and leaves the real watcher orphaned — which then keeps writing wakes into
+  # the shared stub log and corrupts LATER sections' counts.
+  "$SANDBOX/bin/task-worktree" watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 &
+  WPID=$!
+  WATCHER_PIDS="$WATCHER_PIDS $WPID"
+}
+# The watcher logs 'phase 1 done' the moment it has finished witnessing the
+# work phase and entered its settle loop. Waiting for that is a REAL
+# synchronisation point: it replaces the old `sleep 2` guess at "the watcher is
+# probably up by now", which was both slower and weaker (a slow boot under load
+# could make the case mutate state before the watcher ever looked).
+watch_log_has() { grep -q "$1" "$SANDBOX/.dispatch/logs/watch-$AID.log" 2>/dev/null; }
+wait_watcher_armed() { wait_until 'watch_log_has "phase 1 done"'; }
+wait_watcher_rearmed() { wait_until "[ \$(grep -c 're-armed' \"\$SANDBOX/.dispatch/logs/watch-\$AID.log\" 2>/dev/null) -ge $1 ]"; }
+
+stop_watchers() {
+  local p
+  for p in $WATCHER_PIDS; do
+    kill "$p" >/dev/null 2>&1
+  done
+  for p in $WATCHER_PIDS; do
+    wait "$p" 2>/dev/null
+  done
+  WATCHER_PIDS=""; WPID=""
+  return 0
+}
 state() { printf '%s %s\n' "$2" "${3:-$((RANDOM + 1000))}" > "$HERDR_STUB_STATE/$1"; }
 # seq_state <agent> <status> <seq>  — explicit, monotonic
 seq_state() { printf '%s %s\n' "$2" "$3" > "$HERDR_STUB_STATE/$1"; }
@@ -192,20 +395,21 @@ settles() { grep -c '"event":[ ]*"settled"' "$SANDBOX/.dispatch/ledger.jsonl" 2>
 wakes()   { grep -c '^PROMPT' "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
 ledger()  { cat "$SANDBOX/.dispatch/ledger.jsonl"; }
 
-printf '\n\033[1mtask-worktree selftest\033[0m  (%s)\n\n' "$SRC"
+printf '\n\033[1mtask-worktree selftest\033[0m  (%s)\n' "$SRC"
 
 # ===========================================================================
-printf '\033[1m0. the script parses\033[0m\n'
-# ===========================================================================
+sect_0() {
+section "0. the script parses"
 # Guards a nasty bash 3.2 (macOS) trap: inside $( ... ), the parser scans the
 # heredoc body for quotes, so a lone apostrophe in a python comment silently
 # breaks the whole script.
 err="$(bash -n "$SRC" 2>&1)"
 is "bash -n is clean (watch for apostrophes in heredocs inside \$())" "${err:-clean}" "clean"
+}
 
 # ===========================================================================
-printf '\n\033[1m1. herdr --until contract (the regression that broke the watcher)\033[0m\n'
-# ===========================================================================
+sect_1() {
+section "1. herdr --until contract (the regression that broke the watcher)"
 herdr agent wait x --until idle done blocked >/dev/null 2>&1; rc=$?
 is "multi-value '--until idle done blocked' exits rc=2" "$rc" "2"
 
@@ -224,10 +428,11 @@ if [ -n "$hits" ]; then
 else
   ok "the script never passes a multi-value --until"
 fi
+}
 
 # ===========================================================================
-printf '\n\033[1m2. exactly-once: executor done + watcher backstop\033[0m\n'
-# ===========================================================================
+sect_2() {
+section "2. exactly-once: executor done + watcher backstop"
 setup; seq_state "$AID" working 20
 TW done "$AID" --note "primary path" >/dev/null 2>&1
 is "executor 'done' records one settle" "$(settles)" "1"
@@ -243,10 +448,11 @@ is "a repeated 'done' in the same settle is suppressed" "$(settles)" "1"
 
 TW done "$AID" --note "forced" --force >/dev/null 2>&1
 is "--force overrides the claim" "$(settles)" "2"
+}
 
 # ===========================================================================
-printf '\n\033[1m3. re-arming: settle -> steer -> settle reports every time\033[0m\n'
-# ===========================================================================
+sect_3() {
+section "3. re-arming: settle -> steer -> settle reports every time"
 setup; seq_state "$AID" idle 30
 TW notify-settle "$AID" --by watcher --status awaiting-dispatch >/dev/null 2>&1
 is "first settle reported" "$(settles)" "1"
@@ -261,10 +467,11 @@ seq_state "$AID" idle 32
 TW notify-settle "$AID" --by watcher --status awaiting-dispatch >/dev/null 2>&1
 is "second settle reports after release (re-armed)" "$(settles)" "2"
 is "and wakes Dispatch again" "$(wakes)" "2"
+}
 
 # ===========================================================================
-printf '\n\033[1m4. re-arming survives a DEAD watcher (seq-advance fallback)\033[0m\n'
-# ===========================================================================
+sect_4() {
+section "4. re-arming survives a DEAD watcher (seq-advance fallback)"
 setup; seq_state "$AID" working 40
 TW done "$AID" --note "first" >/dev/null 2>&1
 is "executor reports settle 1" "$(settles)" "1"
@@ -273,80 +480,115 @@ is "executor reports settle 1" "$(settles)" "1"
 seq_state "$AID" working 45
 TW done "$AID" --note "second, after being steered" >/dev/null 2>&1
 is "executor reports settle 2 anyway" "$(settles)" "2"
+}
 
 # ===========================================================================
-printf '\n\033[1m5. watcher: boot transient must NOT produce a false settle\033[0m\n'
-# ===========================================================================
+sect_5() {
+section "5. watcher: boot transient must NOT produce a false settle"
 setup
 # The classic race: the agent reads idle/done for a moment right after boot.
 seq_state "$AID" idle 50
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 3
+start_watcher
+# NEGATIVE assertion: there is no event to wait for, so this needs a real
+# dwell (see DWELL above) — the watcher must be given the chance to get it
+# wrong before we can claim it did not.
+dwell
 early="$(settles)"
+# ...and a DETERMINISTIC companion to that dwell. The watcher must not arm its
+# settle loop until it has witnessed a genuine work phase, and it says so in
+# its own log. Unlike the dwell, this does not weaken when the machine is
+# loaded (load can only make the watcher slower to arm, never faster), so the
+# witnessed-work-phase defence stays covered no matter how busy the host is.
+armed_unwitnessed=no
+watch_log_has 'witnessed=0' && armed_unwitnessed=yes
+is "the settle loop is not armed before a work phase is witnessed" "$armed_unwitnessed" "no"
+# --falsify needs to distinguish "the dwell failed to catch the bug" from "the
+# bug never reproduced": on a badly oversubscribed host the broken watcher can
+# be so slow that this case sets it working before it ever arms, and it then
+# behaves CORRECTLY by accident. Record which happened.
+[ "$FALSIFY" -eq 1 ] && printf '%s\n' "$armed_unwitnessed" > "$RESDIR/falsify.armed"
 seq_state "$AID" working 51                    # ... then it actually starts
-sleep 3
+wait_watcher_armed                             # it witnesses the work phase
+dwell                                          # negative again: none while working
 mid="$(settles)"
 seq_state "$AID" idle 52                       # ... and genuinely finishes
-sleep 6
+wait_settles 1                                 # POSITIVE: wait for the event
+dwell                                          # then prove no SECOND settle follows
 final="$(settles)"
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "no settle recorded during the boot transient" "$early" "0"
 is "no settle recorded while working" "$mid" "0"
 is "exactly one settle recorded after the real finish" "$final" "1"
 is "Dispatch woken exactly once" "$(wakes)" "1"
 note "$(ledger | tail -1)"
+}
 
 # ===========================================================================
-printf '\n\033[1m6. watcher: settle is detected at all (the spin-forever bug)\033[0m\n'
-# ===========================================================================
+sect_6() {
+section "6. watcher: settle is detected at all (the spin-forever bug)"
 setup; seq_state "$AID" working 60
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 2
+start_watcher
+wait_watcher_armed
 seq_state "$AID" idle 61
-sleep 6
+wait_settles 1
+dwell                                          # exactly-once: no duplicate
 got="$(settles)"
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "a working->idle transition is recorded" "$got" "1"
 if grep -q '"status": *"awaiting-dispatch"' "$SANDBOX/.dispatch/ledger.jsonl"; then
   ok "recorded with status awaiting-dispatch"
 else bad "recorded with status awaiting-dispatch" "$(ledger | tail -1)"; fi
+}
 
 # ===========================================================================
-printf '\n\033[1m7. watcher: blocked settles are reported as blocked\033[0m\n'
-# ===========================================================================
+sect_7() {
+section "7. watcher: blocked settles are reported as blocked"
 setup; seq_state "$AID" working 70
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 2; seq_state "$AID" blocked 71; sleep 6
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+start_watcher
+wait_watcher_armed
+seq_state "$AID" blocked 71
+wait_settles 1
+stop_watchers
 if grep -q '"status": *"blocked"' "$SANDBOX/.dispatch/ledger.jsonl"; then
   ok "blocked settle recorded as blocked"
 else bad "blocked settle recorded as blocked" "$(ledger | tail -1)"; fi
+}
 
 # ===========================================================================
-printf '\n\033[1m8. watcher: re-arms on a second settle (live)\033[0m\n'
-# ===========================================================================
+sect_8() {
+section "8. watcher: re-arms on a second settle (live)"
 setup; seq_state "$AID" working 80
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 2; seq_state "$AID" idle 81;    sleep 5
+start_watcher
+wait_watcher_armed
+seq_state "$AID" idle 81
+wait_settles 1
 first="$(settles)"
-seq_state "$AID" working 82;          sleep 4      # steered
-seq_state "$AID" idle 83;             sleep 6      # settles again
+seq_state "$AID" working 82                       # steered
+# the watcher must OBSERVE the resume and release its claim before the next
+# settle can be reported — wait for that, do not guess at it.
+wait_watcher_rearmed 1
+seq_state "$AID" idle 83                          # settles again
+wait_settles 2
+dwell                                             # and no third
 second="$(settles)"
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "first settle reported" "$first" "1"
 is "second settle reported too (re-armed)" "$second" "2"
 is "Dispatch woken exactly twice, once per settle" "$(wakes)" "2"
+}
 
 # ===========================================================================
-printf '\n\033[1m9. watcher FAILS LOUD instead of spinning (dead executor)\033[0m\n'
-# ===========================================================================
+sect_9() {
+section "9. watcher FAILS LOUD instead of spinning (dead executor)"
 setup; seq_state "$AID" working 90
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 2
+start_watcher
+wait_watcher_armed
 rm -f "$HERDR_STUB_STATE/$AID"                 # the agent vanishes: herdr errors
-sleep 10
+# POSITIVE: wait for the watcher process to actually EXIT. (The old fixed
+# 10s sleep asserted the same thing, just always paying the worst case.)
+wait_gone "$WPID"
 alive=0; kill -0 "$WPID" 2>/dev/null && alive=1
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "watcher exits instead of looping on a herdr failure" "$alive" "0"
 if grep -qE 'watcher-failed|"status": *"orphaned"' "$SANDBOX/.dispatch/ledger.jsonl"; then
   ok "the failure is recorded durably in the ledger"
@@ -355,10 +597,11 @@ is "and Dispatch is woken about it (a dead executor is real news)" "$(wakes)" "1
 if grep -q 'ABORT' "$SANDBOX/.dispatch/logs/watch-$AID.log" 2>/dev/null; then
   ok "and logged to .dispatch/logs/watch-<id>.log"
 else bad "and logged to .dispatch/logs/watch-<id>.log"; fi
+}
 
 # ===========================================================================
-printf '\n\033[1m10. reconcile repairs a ledger stuck at working\033[0m\n'
-# ===========================================================================
+sect_10() {
+section "10. reconcile repairs a ledger stuck at working"
 setup; seq_state "$AID" idle 100
 out="$(TW reconcile --dry-run 2>&1)"
 case "$out" in *REPAIR*) ok "dry-run spots the stuck task" ;; *) bad "dry-run spots the stuck task" "$out" ;; esac
@@ -367,10 +610,11 @@ TW reconcile >/dev/null 2>&1
 is "reconcile records the missed settle" "$(settles)" "1"
 TW reconcile >/dev/null 2>&1
 is "reconcile is idempotent" "$(settles)" "1"
+}
 
 # ===========================================================================
-printf '\n\033[1m11. done ergonomics\033[0m\n'
-# ===========================================================================
+sect_11() {
+section "11. done ergonomics"
 setup; seq_state "$AID" working 110
 printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
 ( cd "$SANDBOX/tasks/$AID" && "$SANDBOX/bin/task-worktree" done --note "found my own id" >/dev/null 2>&1 )
@@ -388,10 +632,11 @@ if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then ok "--body-file is persisted
 else bad "--body-file is persisted to reports/<id>.executor.md"; fi
 if grep -q 'https://x/pr/1' "$HERDR_STUB_LOG"; then ok "the PR url reaches the Dispatch wake"
 else bad "the PR url reaches the Dispatch wake" "$(cat "$HERDR_STUB_LOG")"; fi
+}
 
 # ===========================================================================
-printf '\n\033[1m12. settle CLASSIFIER: why did the agent go idle?\033[0m\n'
-# ===========================================================================
+sect_12() {
+section "12. settle CLASSIFIER: why did the agent go idle?"
 setup; seq_state "$AID" idle 120
 pi_session completed;   is "stopReason=stop                        -> completed"       "$(cause)" "completed"
 pi_session human;       is "'Operation aborted' (pi /stop)          -> human-interrupt" "$(cause)" "human-interrupt"
@@ -402,10 +647,11 @@ pi_session mid-tool;    is "session ends mid tool-loop              -> unknown" 
 no_pi_session;          is "no session log at all                   -> unknown"         "$(cause)" "unknown"
 HERDR_STUB_AGENT=claude pi_session human
 is "a non-pi agent kind                     -> unknown" "$(HERDR_STUB_AGENT=claude cause)" "unknown"
+}
 
 # ===========================================================================
-printf '\n\033[1m13. human interrupt is SUPPRESSED but never invisible\033[0m\n'
-# ===========================================================================
+sect_13() {
+section "13. human interrupt is SUPPRESSED but never invisible"
 setup; seq_state "$AID" idle 130; pi_session human
 TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
 is "no settle recorded for a human stop" "$(settles)" "0"
@@ -426,10 +672,11 @@ is "re-probing the same interruption adds nothing" "$(pauses)" "1"
 pi_session human e9                              # a NEW, distinct interruption
 TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
 is "a distinct later interruption IS recorded" "$(pauses)" "2"
+}
 
 # ===========================================================================
-printf '\n\033[1m14. suppression must not poison the exactly-once gate\033[0m\n'
-# ===========================================================================
+sect_14() {
+section "14. suppression must not poison the exactly-once gate"
 setup; seq_state "$AID" idle 140; pi_session human
 TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
 is "human stop suppressed" "$(settles)" "0"
@@ -441,10 +688,11 @@ is "and wakes Dispatch exactly once" "$(wakes)" "1"
 TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
 is "the backstop is still de-duplicated against it" "$(settles)" "1"
 is "no double wake" "$(wakes)" "1"
+}
 
 # ===========================================================================
-printf '\n\033[1m15. everything that is NOT positively human still wakes\033[0m\n'
-# ===========================================================================
+sect_15() {
+section "15. everything that is NOT positively human still wakes"
 for kind in completed crash retry-crash mid-tool; do
   setup; seq_state "$AID" idle 150; pi_session "$kind"
   TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
@@ -465,63 +713,76 @@ is "a watcher-failure (--force) is never suppressed" "$(wakes)" "1"
 setup; seq_state "$AID" idle 154; pi_session human
 TW done "$AID" --note "executor self-report" >/dev/null 2>&1
 is "the executor's 'done' is never classified or suppressed" "$(settles)" "1"
+}
 
 # ===========================================================================
-printf '\n\033[1m16. live watcher: stop -> steer -> finish reports exactly once\033[0m\n'
-# ===========================================================================
+sect_16() {
+section "16. live watcher: stop -> steer -> finish reports exactly once"
 setup; seq_state "$AID" working 160; pi_session mid-tool
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 2
+start_watcher
+wait_watcher_armed
 pi_session human; seq_state "$AID" idle 161       # the HUMAN hits /stop
-sleep 6
+# POSITIVE: the watcher must reach a verdict on the stop (it records the pause).
+wait_pauses 1
+# NEGATIVE: and having reached it, must NOT go on to settle/wake. No event to
+# wait for, so dwell.
+dwell
 after_stop_settles="$(settles)"; after_stop_wakes="$(wakes)"; after_stop_pauses="$(pauses)"
 pi_session mid-tool; seq_state "$AID" working 162 # the human steers it
-sleep 4
+wait_watcher_rearmed 1                            # it observes the resume
 pi_session completed; seq_state "$AID" idle 163   # it finishes for real
-sleep 7
+wait_settles 1
+dwell                                             # exactly-once: no duplicate
 final_settles="$(settles)"; final_wakes="$(wakes)"
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "human stop: nothing settled" "$after_stop_settles" "0"
 is "human stop: Dispatch NOT woken" "$after_stop_wakes" "0"
 is "human stop: recorded as paused-by-human" "$after_stop_pauses" "1"
 is "real finish: one settle" "$final_settles" "1"
 is "real finish: woken EXACTLY once (watcher stayed armed)" "$final_wakes" "1"
 note "$(ledger | tail -2)"
+}
 
 # ===========================================================================
-printf '\n\033[1m17. live watcher: an agent-error settle still wakes\033[0m\n'
-# ===========================================================================
+sect_17() {
+section "17. live watcher: an agent-error settle still wakes"
 setup; seq_state "$AID" working 170; pi_session mid-tool
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 2
+start_watcher
+wait_watcher_armed
 pi_session crash; seq_state "$AID" idle 171
-sleep 7
+wait_settles 1
+dwell                                             # exactly-once: no duplicate
 got_s="$(settles)"; got_w="$(wakes)"
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "a provider-error settle is recorded" "$got_s" "1"
 is "and Dispatch is woken (the human must hear about it)" "$got_w" "1"
 if grep -q '"cause": *"agent-error"' "$SANDBOX/.dispatch/ledger.jsonl"; then
   ok "the cause is recorded on the settle event"
 else bad "the cause is recorded on the settle event" "$(ledger | tail -1)"; fi
+}
 
 # ===========================================================================
-printf '\n\033[1m18. boot transient + human stop must not resurrect each other\033[0m\n'
-# ===========================================================================
+sect_18() {
+section "18. boot transient + human stop must not resurrect each other"
 setup; seq_state "$AID" idle 180; pi_session human   # freshly booted AND idle
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 3
+start_watcher
+dwell                                              # NEGATIVE: boot transient
 boot="$(settles)"
-seq_state "$AID" working 181; pi_session mid-tool; sleep 3
-pi_session completed; seq_state "$AID" idle 182; sleep 7
+seq_state "$AID" working 181; pi_session mid-tool
+wait_watcher_armed                                 # it witnesses the work phase
+pi_session completed; seq_state "$AID" idle 182
+wait_settles 1
+dwell                                              # exactly-once: no duplicate
 final="$(settles)"
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "no false settle during the boot transient" "$boot" "0"
 is "the real finish still reports" "$final" "1"
 is "and wakes exactly once" "$(wakes)" "1"
+}
 
 # ===========================================================================
-printf '\n\033[1m19. reconcile understands paused-by-human\033[0m\n'
-# ===========================================================================
+sect_19() {
+section "19. reconcile understands paused-by-human"
 setup; seq_state "$AID" idle 190; pi_session human
 TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
 TW reconcile >/dev/null 2>&1
@@ -532,26 +793,126 @@ pi_session completed                                   # it later finishes
 TW reconcile >/dev/null 2>&1
 is "once it really finishes, reconcile repairs + wakes" "$(settles)" "1"
 is "waking Dispatch once" "$(wakes)" "1"
+}
 
 # ===========================================================================
-printf '\n\033[1m20. re-arm cannot deadlock on a turn it never saw\033[0m\n'
-# ===========================================================================
+sect_20() {
+section "20. re-arm cannot deadlock on a turn it never saw"
 # A steered turn can start AND finish inside the watcher blind spot. The old
 # re-arm loop waited forever for a 'working' it had already missed, so the next
 # genuine settle was never reported. The session log moving on is the way out.
 setup; seq_state "$AID" working 200; pi_session mid-tool
-( TW watch "$AID" --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1 ) & WPID=$!
-sleep 2
+start_watcher
+wait_watcher_armed
 pi_session completed e5; seq_state "$AID" idle 201        # first settle
-sleep 7
+wait_settles 1
 first="$(settles)"
 # steered + finished entirely between probes: status never reads 'working'
 pi_session completed e6; seq_state "$AID" idle 202
-sleep 14
+wait_settles 2
+dwell                                                    # and no third
 second="$(settles)"
-kill "$WPID" >/dev/null 2>&1; wait "$WPID" 2>/dev/null; stop_watchers
+stop_watchers
 is "first settle reported" "$first" "1"
 is "the missed turn's settle is reported too (no deadlock)" "$second" "2"
+}
 
+# Longest sections FIRST: with bounded concurrency the makespan is dominated by
+# whatever starts last, so the live-watcher cases (the only ones that dwell) go
+# out of the gate first and the cheap ones backfill around them.
+SECTION_ORDER="5 16 18 8 20 6 17 15 7 9 11 2 19 12 3 1 14 4 10 13 0"
+
+# ---------------------------------------------------------------------------
+# the runner
+#
+# Every section runs in its own subshell against its own sandbox + its own stub
+# state/log (see setup()), so there is nothing left to serialise them for. Each
+# writes its output and its pass/fail/elapsed tally to a file; the parent then
+# replays them in the CANONICAL order, so the transcript is identical whatever
+# the concurrency is. -j1 is exactly the old serial behaviour.
+# ---------------------------------------------------------------------------
+RESDIR="$TMPROOT/results"; mkdir -p "$RESDIR"
+
+_run_one() {
+  local n="$1" t0
+  # A child must NEVER inherit the parent's cleanup trap, or the first section
+  # to finish would delete the whole run's TMPROOT out from under the others.
+  trap - EXIT
+  CASE_PREFIX="$n"; CASE_SEQ=0
+  t0="$(_ms)"
+  {
+    "sect_$n"
+    stop_watchers
+  } > "$RESDIR/$n.out" 2>&1
+  printf '%s %s %s\n' "$PASS" "$FAIL" "$(( $(_ms) - t0 ))" > "$RESDIR/$n.tally"
+}
+
+_live_jobs() {
+  local p c=0
+  for p in $RUN_PIDS; do kill -0 "$p" 2>/dev/null && c=$((c + 1)); done
+  printf '%s\n' "$c"
+}
+
+RUN_PIDS=""
+for n in $SECTION_ORDER; do
+  if [ "$JOBS" -gt 1 ]; then
+    while [ "$(_live_jobs)" -ge "$JOBS" ]; do sleep 0.02; done
+    _run_one "$n" & RUN_PIDS="$RUN_PIDS $!"
+  else
+    ( _run_one "$n" )
+  fi
+done
+wait
+
+# replay in canonical order and tally
+TIMINGS=""
+SECTION_FAILS=""
+for n in $(printf '%s\n' $SECTION_ORDER | sort -n); do
+  if [ -s "$RESDIR/$n.tally" ]; then
+    cat "$RESDIR/$n.out"
+    read -r p f el < "$RESDIR/$n.tally"
+    PASS=$((PASS + p)); FAIL=$((FAIL + f))
+    TIMINGS="$TIMINGS$el	section $n\n"
+    SECTION_FAILS="$SECTION_FAILS$n=$f "
+  else
+    printf '\n  \033[31mFAIL\033[0m section %s produced no result (it crashed)\n' "$n"
+    [ -f "$RESDIR/$n.out" ] && cat "$RESDIR/$n.out"
+    FAIL=$((FAIL + 1))
+  fi
+done
+
+# section_failed <n> -> rc 0 if section <n> recorded at least one failure
+section_failed() {
+  case " $SECTION_FAILS" in *" $1=0 "*) return 1 ;; *" $1="*) return 0 ;; esac
+  return 1
+}
+
+timing_report() {
+  local total=$(( $(_ms) - RUN_T0 ))
+  printf '\n\033[1mtiming breakdown\033[0m (section wall-clock, slowest first; -j%s)\n' "$JOBS"
+  printf "$TIMINGS" | sort -rn | awk -F'\t' '$0 != "" {printf "  %7.2fs  %s\n", $1/1000, $2}'
+  printf '  %7.2fs  \033[1mTOTAL (wall clock)\033[0m\n' "$(awk -v t="$total" 'BEGIN{print t/1000}')"
+}
+
+timing_report
 printf '\n\033[1m%d passed, %d failed\033[0m\n\n' "$PASS" "$FAIL"
+
+if [ "$FALSIFY" -eq 1 ]; then
+  if section_failed 5; then
+    printf '\033[32mFALSIFICATION OK\033[0m: section 5 caught the broken watcher (%d failures overall).\n\n' "$FAIL"
+    exit 0
+  fi
+  if [ "$(cat "$RESDIR/falsify.armed" 2>/dev/null)" != "yes" ]; then
+    printf '\033[33mFALSIFICATION INCONCLUSIVE\033[0m: the bug never reproduced.\n'
+    printf 'The sabotaged watcher was so slow to start (heavy load on this host) that\n'
+    printf 'section 5 had already set the agent working before it armed — so it\n'
+    printf 'witnessed a real work phase and behaved CORRECTLY by accident. This says\n'
+    printf 'nothing about the %ss dwell. Re-run on an unloaded machine.\n\n' "$DWELL"
+    exit 2
+  fi
+  printf '\033[31mFALSIFICATION FAILED\033[0m: a watcher that armed its settle loop WITHOUT\n'
+  printf 'witnessing a work phase still passed section 5. The %ss dwell is too short —\n' "$DWELL"
+  printf 'its negative assertions are vacuous and no longer detect the bug they exist for.\n\n'
+  exit 1
+fi
 [ "$FAIL" -eq 0 ]
