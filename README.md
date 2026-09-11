@@ -107,7 +107,23 @@ any task whose ledger status drifted from live herdr state.
 
 `bin/task-worktree-selftest` exercises all of this against a scripted fake herdr
 (exactly-once, re-arming, the boot-transient guard, the settle classifier and
-the fail-loud paths).
+the fail-loud paths). It runs its sections concurrently — each has its own
+sandbox, its own stub state and its own watcher — and finishes in ~10s:
+
+```
+bin/task-worktree-selftest             # all 89 checks (default -j6)
+bin/task-worktree-selftest -j1         # serial, for debugging; same transcript
+bin/task-worktree-selftest --falsify   # prove the timing-sensitive checks still bite
+```
+
+The live-watcher cases wait on **conditions** ("until a settle is recorded",
+"until the watcher exits") rather than sleeping for a worst case. The few
+assertions that are inherently negative ("*no* settle during the boot
+transient") cannot be condition-waited, so they dwell for one tunable constant
+— and `--falsify` exists to prove that constant is still long enough: it
+disables the watcher's boot-transient defences and **requires** the suite to
+catch it. If a shortened dwell ever made those checks vacuous, `--falsify`
+fails loudly instead of the suite quietly passing for the wrong reason.
 
 ## What's tracked here
 

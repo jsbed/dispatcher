@@ -737,7 +737,7 @@ PY
       [ "$quiet" -eq 1 ] || info "woke Dispatch ($pane) for $id settle #$epoch"
       return 0
     }
-    sleep 10
+    sleep "${TASK_WAKE_RETRY_SLEEP_S:-10}"
   done
   info "warning: could not wake Dispatch ($pane) after 5 attempts; settle #$epoch is still recorded in the ledger"
 }
@@ -892,6 +892,13 @@ cmd_watch() {
   # purpose: an unbounded wait never returns if the agent disappears mid-wait.
   local probe_ms="${TASK_WATCH_PROBE_TIMEOUT_MS:-60000}"
   local resume_ms="${TASK_WATCH_RESUME_TIMEOUT_MS:-30000}"
+  # How long phase 1 may block waiting to witness a genuine work phase, and how
+  # long the re-arm loop backs off once it has given up on a resume. Both are
+  # overridable purely so the selftest can drive this loop at millisecond
+  # speed; the DEFAULTS here are the production values and must not shrink.
+  local witness_ms="${TASK_WATCH_WITNESS_TIMEOUT_MS:-30000}"
+  local witness_tries="${TASK_WATCH_WITNESS_TRIES:-6}"
+  local rearm_backoff_s="${TASK_WATCH_REARM_BACKOFF_S:-30}"
 
   _watch_log "watch start (pid $$, debounce=${debounce}s, max_spins=$max_spins, pane=${pane:-auto})"
 
@@ -903,8 +910,10 @@ cmd_watch() {
   # never shows work across all attempts (a genuinely fast task that finished
   # before we looked), fall through — phase 2's debounce still guards us.
   local witnessed=0
-  for n in 1 2 3 4 5 6; do
-    rc=0; _hwait "$id" --until working --timeout 30000 || rc=$?
+  n=0
+  while [ "$n" -lt "$witness_tries" ]; do
+    n=$((n + 1))
+    rc=0; _hwait "$id" --until working --timeout "$witness_ms" || rc=$?
     [ "$rc" -ge 2 ] && _watch_rc2 "$id"
     if [ "$(_agent_status "$id")" = "working" ]; then witnessed=1; break; fi
     sleep "$debounce"
@@ -992,7 +1001,7 @@ cmd_watch() {
       # instead of aborting — but we never hot-spin.
       if [ "$spins" -gt "$max_spins" ]; then
         _watch_log "re-arm: no resume after $spins probes; backing off"
-        sleep 30
+        sleep "$rearm_backoff_s"
       fi
     done
     witnessed=1
