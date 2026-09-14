@@ -60,6 +60,22 @@ primary completion path, and it is a hard requirement of this contract:
    `task-worktree done --blocked --note "<what you need>"` so Dispatch hears it
    immediately instead of waiting on a watcher.
 
+## If you are a BRAINSTORM session (`TASK_MODE=brainstorm` in `task.env`)
+
+Your opening brief — not this file — is your contract, and it overrides rules 4
+and 5 above. In short:
+
+- You are in a **live dialogue with a human** in your own pane. Going idle
+  between turns is normal and reports nothing to anyone; nobody is waiting.
+- You **do not commit, push or open PRs**, and you do not implement. Your
+  worktree exists so you can read real code before asserting anything about it.
+- The session ends only when the **human** ends it — they say so directly, or a
+  wrap-up request arrives from Dispatch. Then you write the plan to a markdown
+  file and deliver it with
+  `task-worktree done --note "..." --body-file <that file>`.
+- That plan is the **only** thing that survives: the task auto-closes afterwards
+  and the worktree and branch are deleted.
+
 ## Scope discipline
 
 Do exactly the task you were briefed on. If you discover adjacent work that seems

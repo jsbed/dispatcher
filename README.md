@@ -22,8 +22,9 @@ executor finishes it reports back, and Dispatch surfaces the result to you.
 ```
 bin/task-worktree create     # spin a task: worktree + executor agent
 bin/task-worktree handoff    # swap in a fresh-context executor (same worktree/branch)
+bin/task-worktree wrapup     # ask a live brainstorm session for its plan (human's word only)
 bin/task-worktree done       # (executors) "I am finished" — wakes Dispatch
-bin/task-worktree report     # persist an executor's report; auto-close if investigative
+bin/task-worktree report     # persist a report; auto-close if investigate/brainstorm
 bin/task-worktree list       # task status from the ledger
 bin/task-worktree reconcile  # repair ledger status from live herdr state
 bin/task-worktree classify   # why is an executor idle? (stopped by you / done / crashed)
@@ -31,9 +32,11 @@ bin/task-worktree remove     # close a task and clean up (keeps the branch)
 bin/task-worktree prune      # reconcile dangling symlinks
 ```
 
-Two kinds of task:
+Three kinds of task:
 - **`--mode code`** — changes files; stays open for review, closed later.
 - **`--mode investigate`** — read-only "find me X"; reports and cleans itself up.
+- **`--mode brainstorm`** — a live dialogue **you** drive in the session's own
+  pane; it produces a plan and cleans itself up (see below).
 
 ### Handing off to a fresh context
 
@@ -63,6 +66,36 @@ an existing **open** PR: the worktree is that PR's head branch (resolved with
 `.dispatch/autopilot.PROMPT.md` to drive conflicts → review comments → CI to
 green. `--pr` owns the branch and base (it refuses `--branch`/`--base`) and
 defaults the slug to `autopilot-pr-<N>`.
+
+### Brainstorm a design, or get grilled on one
+
+```
+bin/task-worktree create --slug ideas --repo core \
+  --mode brainstorm --skill <brainstorm|grill|both>
+```
+
+This is the one mode where **you talk to the agent yourself** — `create` prints
+how to attach (`herdr agent focus <id>`). It gets a real worktree off the fresh
+main tip so it can read actual code, but it never commits.
+
+`--skill` is **required and has no default**: `brainstorm` turns an idea into a
+design, `grill` interrogates a plan round by round, `both` composes the two. The
+brief is assembled from `.dispatch/brainstorm.PROMPT.md` (the shared dialogue
+frame) plus the selected `.dispatch/brainstorm.skill-*.md` fragments, so the
+selection genuinely changes the session rather than labelling it. Dispatch is
+instructed to **ask you** which you want and never to choose for you.
+
+Because it is a conversation, the session is **idle most of the time** — that is
+recorded once as `in-conversation` and deliberately never reported as a settle,
+so Dispatch is not spammed turn by turn. It is woken **exactly once**: when the
+plan arrives. An agent *crash* still wakes it loudly; a pause between turns does
+not.
+
+It ends only when **you** say so — either by telling the session "write it up",
+or by telling Dispatch to run `bin/task-worktree wrapup <id>`. Both land in the
+same place: the session delivers a plan (decided / rejected / open questions /
+next tasks) through the ordinary `done` path, it is persisted to
+`reports/<id>.md`, and the task auto-closes.
 
 ## How a task reports back
 

@@ -406,6 +406,37 @@ pi_session() {
 no_pi_session() { rm -rf "$TASK_PI_SESSIONS_DIR"; }
 cause() { TW classify "$AID" | cut -f1; }
 pauses() { grep -c '"event": *"paused"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
+
+# ---------------------------------------------------------------------------
+# brainstorm fixtures
+#
+# A brainstorm session is a DIALOGUE: it is idle most of the time, waiting for
+# the human to type. The machinery must treat that idle as a non-event, so the
+# task's ledger record has to say mode=brainstorm before the classifier runs.
+# ---------------------------------------------------------------------------
+brainstorm_ledger() {
+  printf '%s\n' "{\"event\":\"created\",\"id\":\"$AID\",\"slug\":\"demo\",\"branch\":\"demo\",\"primary_repo\":\"none\",\"mode\":\"brainstorm\",\"skills\":\"${1:-both}\",\"dispatch_pane\":\"wDISPATCH:p1\",\"worktrees\":[],\"status\":\"working\",\"ts\":\"x\"}" \
+    > "$SANDBOX/.dispatch/ledger.jsonl"
+}
+convos() { grep -c '"event": *"conversing"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
+wait_convos() { wait_until "[ \"\$(convos)\" -ge $1 ]" "${2:-}"; }
+reports_n() { grep -c '"event": *"reported"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
+# wakes() counts EVERY prompt the stub saw; once a case prompts the AGENT too
+# (wrapup does), "did Dispatch get woken" has to be counted separately.
+dwakes() { grep -c "^PROMPT	wDISPATCH:p1" "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
+agent_prompts() { grep -c "^PROMPT	$AID" "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
+
+# the real .dispatch/ brainstorm templates, in the sandbox's .dispatch/
+brainstorm_sandbox() {
+  local d f
+  d="$(dirname "$SRC")/../.dispatch"
+  for f in brainstorm.PROMPT.md brainstorm.skill-brainstorm.md brainstorm.skill-grill.md; do
+    cp "$d/$f" "$SANDBOX/.dispatch/" 2>/dev/null || { bad "the template $f exists in .dispatch/"; return 1; }
+  done
+  export TASK_REPOS_DIR="$SANDBOX/repos"
+  export TASK_WORKTREE_STORE="$SANDBOX/wtstore"
+  mkdir -p "$TASK_REPOS_DIR" "$TASK_WORKTREE_STORE"
+}
 # ---------------------------------------------------------------------------
 # live watcher lifecycle
 #
@@ -997,10 +1028,228 @@ case "$(TW create --help 2>&1)" in *--pr*) ok "create --help documents --pr" ;;
   *) bad "create --help documents --pr" ;; esac
 }
 
+# ===========================================================================
+sect_22() {
+section "22. brainstorm: an idle session is a CONVERSATION, not a settle"
+# The whole premise of --mode brainstorm: the human is typing at it, so it is
+# idle between every turn. If that produced a settle, Dispatch would be woken on
+# every conversational turn AND the exactly-once claim would be burned.
+setup; brainstorm_ledger both
+seq_state "$AID" working 220; pi_session mid-tool
+start_watcher
+wait_watcher_armed
+pi_session completed e5; seq_state "$AID" idle 221   # turn ends; waiting for the human
+# POSITIVE: the watcher must reach a verdict (it records the conversation).
+wait_convos 1
+# NEGATIVE: and having reached it, must NOT settle or wake. No event to wait
+# for, so dwell (see DWELL).
+dwell
+is "an idle brainstorm session records NO settle" "$(settles)" "0"
+is "and does NOT wake Dispatch" "$(dwakes)" "0"
+is "but a durable 'conversing' event IS recorded" "$(convos)" "1"
+if grep -q '"status": *"in-conversation"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "with status in-conversation"
+else bad "with status in-conversation" "$(ledger | tail -1)"; fi
+if [ -z "$(grep '^NOTIFY' "$HERDR_STUB_LOG" 2>/dev/null)" ]; then
+  ok "and no desktop notification is fired"
+else bad "and no desktop notification is fired" "$(grep '^NOTIFY' "$HERDR_STUB_LOG")"; fi
+case "$(TW list 2>&1)" in *"IN CONVERSATION"*) ok "'list' reads as a conversation, not a stalled task" ;;
+  *) bad "'list' reads as a conversation, not a stalled task" "$(TW list 2>&1)" ;; esac
+case "$(TW list 2>&1)" in *"skills: both"*) ok "'list' shows which skills the session was given" ;;
+  *) bad "'list' shows which skills the session was given" "$(TW list 2>&1)" ;; esac
+
+# turn 2: the human types, it works, it goes idle again. Still not news, and
+# the ledger must not grow a line per turn.
+pi_session mid-tool e6; seq_state "$AID" working 222
+wait_watcher_rearmed 1
+pi_session completed e7; seq_state "$AID" idle 223
+dwell
+is "a second conversational turn still records no settle" "$(settles)" "0"
+is "still no wake" "$(dwakes)" "0"
+is "and does not spam the ledger (one record per conversation)" "$(convos)" "1"
+stop_watchers
+}
+
+# ===========================================================================
+sect_23() {
+section "23. brainstorm: the AGENT dying is NOT a conversational pause"
+# The dangerous failure mode of the suppression above: swallowing a real crash
+# because "brainstorm sessions are always idle". Only cause=completed is a
+# conversation; everything else still wakes.
+setup; brainstorm_ledger grill
+seq_state "$AID" working 230; pi_session mid-tool
+start_watcher
+wait_watcher_armed
+pi_session crash; seq_state "$AID" idle 231          # provider/agent failure
+wait_settles 1
+dwell                                                # exactly-once: no duplicate
+got_s="$(settles)"; got_w="$(dwakes)"
+stop_watchers
+is "an agent-error settle in a brainstorm session IS recorded" "$got_s" "1"
+is "and DOES wake Dispatch" "$got_w" "1"
+is "and is not filed as a conversation" "$(convos)" "0"
+if grep -q '"cause": *"agent-error"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "the cause is recorded on the settle event"
+else bad "the cause is recorded on the settle event" "$(ledger | tail -1)"; fi
+
+# a session that dies mid tool-loop is ambiguous -> still wakes (bias to waking)
+setup; brainstorm_ledger both; seq_state "$AID" idle 232; pi_session mid-tool
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "an ambiguous settle still wakes, even in brainstorm mode" "$(dwakes)" "1"
+
+# and the human stopping it is still a pause, not a conversation
+setup; brainstorm_ledger both; seq_state "$AID" idle 233; pi_session human
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "a human /stop is still recorded as paused-by-human" "$(pauses)" "1"
+is "and still does not wake" "$(dwakes)" "0"
+}
+
+# ===========================================================================
+sect_24() {
+section "24. wrapup: one report, one wake, then auto-close"
+# A UNIQUE task id: the teardown at the end of this section pkills the task's
+# watcher by name, which would otherwise reach into concurrently-running
+# sections that share the default id.
+AID="brainstorm-wrapup-xyz"
+
+# wrapup only applies to a dialogue
+setup; seq_state "$AID" idle 240                     # setup() writes a CODE task
+out="$(TW wrapup "$AID" 2>&1)"; rc=$?
+is "wrapup on a non-brainstorm task is refused" "$rc" "1"
+case "$out" in *brainstorm*) ok "and the error says wrapup is for brainstorm sessions" ;;
+  *) bad "and the error says wrapup is for brainstorm sessions" "$out" ;; esac
+is "and it prompts nobody" "$(wakes)" "0"
+is "and records nothing" "$(settles)" "0"
+
+# an unknown task is refused too
+out="$(TW wrapup no-such-task 2>&1)"; rc=$?
+is "wrapup on an unknown task is refused" "$rc" "1"
+
+# a brainstorm session with no live agent cannot be asked anything
+setup; brainstorm_ledger both; rm -f "$HERDR_STUB_STATE/$AID"
+out="$(TW wrapup "$AID" 2>&1)"; rc=$?
+is "wrapup on a dead session is refused" "$rc" "1"
+case "$out" in *"no live agent"*) ok "and says the session is gone" ;;
+  *) bad "and says the session is gone" "$out" ;; esac
+
+# the real path
+setup; brainstorm_ledger both; seq_state "$AID" idle 241
+TW wrapup "$AID" >/dev/null 2>&1
+is "wrapup succeeds on a live brainstorm session" "$?" "0"
+is "it asks the SESSION (not Dispatch) for the plan" "$(agent_prompts)" "1"
+is "and does not wake Dispatch by itself" "$(dwakes)" "0"
+case "$(grep "^PROMPT	$AID" "$HERDR_STUB_LOG")" in *"WRAP-UP REQUEST"*) ok "the ask is a wrap-up request" ;;
+  *) bad "the ask is a wrap-up request" "$(grep "^PROMPT	$AID" "$HERDR_STUB_LOG")" ;; esac
+for want in Decided Rejected 'Open questions' 'Next tasks'; do
+  case "$(grep "^PROMPT	$AID" "$HERDR_STUB_LOG")" in *"$want"*) ok "the ask names the '$want' section" ;;
+    *) bad "the ask names the '$want' section" ;; esac
+done
+if grep -q '"status": *"wrapping-up"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "the request is recorded durably as wrapping-up"
+else bad "the request is recorded durably as wrapping-up" "$(ledger | tail -1)"; fi
+
+# ...which LIFTS the conversational-idle suppression: a session that writes its
+# plan and then forgets to call 'done' must still be caught by the backstop.
+pi_session completed; seq_state "$AID" idle 242
+TW notify-settle "$AID" --by watcher --status awaiting-dispatch --classify >/dev/null 2>&1
+is "after wrapup, an idle session is news again (backstop still covers it)" "$(settles)" "1"
+is "and it is NOT filed as a conversation" "$(convos)" "0"
+
+# the session delivers through the ORDINARY done path (no second mechanism)
+setup; brainstorm_ledger both; seq_state "$AID" idle 243
+TW wrapup "$AID" >/dev/null 2>&1
+printf '# Plan\n\n## Decided\nx\n' > "$SANDBOX/plan.md"
+seq_state "$AID" working 244
+TW done "$AID" --note "plan delivered" --body-file "$SANDBOX/plan.md" >/dev/null 2>&1
+is "the session's 'done' records exactly one settle" "$(settles)" "1"
+is "and wakes Dispatch exactly once" "$(dwakes)" "1"
+if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then ok "the plan is durable at reports/<id>.executor.md"
+else bad "the plan is durable at reports/<id>.executor.md"; fi
+
+# Dispatch persists it -> exactly one report, and the task auto-closes
+TW report "$AID" --status awaiting-review --note "the plan" \
+  --body-file "$SANDBOX/reports/$AID.executor.md" >/dev/null 2>&1
+is "report writes exactly one report event" "$(reports_n)" "1"
+if [ -f "$SANDBOX/reports/$AID.md" ]; then ok "the plan lands at reports/<id>.md"
+else bad "the plan lands at reports/<id>.md"; fi
+case "$(cat "$SANDBOX/reports/$AID.md")" in *'## Decided'*) ok "and it is the session's own plan" ;;
+  *) bad "and it is the session's own plan" "$(cat "$SANDBOX/reports/$AID.md")" ;; esac
+if grep -q '"event": *"closed"' "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "the task AUTO-CLOSES on report (like investigate)"
+else bad "the task AUTO-CLOSES on report (like investigate)" "$(ledger | tail -1)"; fi
+if [ ! -d "$SANDBOX/tasks/$AID" ]; then ok "and its ephemeral task dir is gone"
+else bad "and its ephemeral task dir is gone"; fi
+is "and the whole wrap-up woke Dispatch exactly once" "$(dwakes)" "1"
+}
+
+# ===========================================================================
+sect_25() {
+section "25. create --mode brainstorm: the skills are CHOSEN, never assumed"
+setup; brainstorm_sandbox; mk_repo widget
+
+# no selection -> refuse, and tell the orchestrator to ASK rather than guess
+out="$(TW create --slug bs --repo widget --mode brainstorm --no-agent 2>&1)"; rc=$?
+is "--mode brainstorm without --skill is refused" "$rc" "1"
+case "$out" in *"ASK THE HUMAN"*) ok "and the error tells Dispatch to ask the human" ;;
+  *) bad "and the error tells Dispatch to ask the human" "$out" ;; esac
+case "$out" in *"do NOT default to 'both'"*) ok "and forbids defaulting to both" ;;
+  *) bad "and forbids defaulting to both" "$out" ;; esac
+is "and nothing is created for it" "$(grep -c '^WORKTREE' "$HERDR_STUB_LOG" | tr -d ' ')" "0"
+
+out="$(TW create --slug bs --repo widget --mode brainstorm --skill bogus --no-agent 2>&1)"; rc=$?
+is "an unknown --skill is refused" "$rc" "1"
+out="$(TW create --slug bs --repo widget --mode code --skill both --no-agent 2>&1)"; rc=$?
+is "--skill outside brainstorm mode is refused" "$rc" "1"
+
+# each selection briefs the session with THAT skill's guidance and no other
+for sel in brainstorm grill both; do
+  setup; brainstorm_sandbox; mk_repo widget
+  TW create --slug bs --repo widget --mode brainstorm --skill "$sel" >/dev/null 2>&1
+  brief="$(grep '^PROMPT' "$HERDR_STUB_LOG" | head -1)"
+  has_b=no; has_g=no
+  case "$brief" in *'Skill: brainstorming'*) has_b=yes ;; esac
+  case "$brief" in *'Skill: grilling'*) has_g=yes ;; esac
+  case "$sel" in
+    brainstorm) is "--skill brainstorm briefs brainstorming" "$has_b" "yes"
+                is "--skill brainstorm does NOT brief grilling" "$has_g" "no" ;;
+    grill)      is "--skill grill briefs grilling" "$has_g" "yes"
+                is "--skill grill does NOT brief brainstorming" "$has_b" "no" ;;
+    both)       is "--skill both briefs brainstorming" "$has_b" "yes"
+                is "--skill both briefs grilling" "$has_g" "yes" ;;
+  esac
+  case "$brief" in *'one question at a time'*|*'One question at a time'*)
+      ok "--skill $sel keeps the shared dialogue frame" ;;
+    *) bad "--skill $sel keeps the shared dialogue frame" "$brief" ;; esac
+done
+
+# the selection is visible afterwards: task.env + ledger, and create says how
+# the human reaches the session at all (the entire point of the mode)
+setup; brainstorm_sandbox; mk_repo widget
+err="$(TW create --slug bs --repo widget --mode brainstorm --skill grill 2>&1 >"$SANDBOX/id.out")"
+id="$(cat "$SANDBOX/id.out")"
+env_file="$SANDBOX/tasks/$id/task.env"
+is "task.env records the mode" "$(. "$env_file" 2>/dev/null; echo "${TASK_MODE:-}")" "brainstorm"
+is "task.env records the skill selection" "$(. "$env_file" 2>/dev/null; echo "${TASK_SKILLS:-}")" "grill"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"skills": "grill"'*) ok "the ledger records the selection" ;;
+  *) bad "the ledger records the selection" "$(tail -1 "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+case "$err" in *"herdr agent focus $id"*) ok "create prints how the human attaches to the pane" ;;
+  *) bad "create prints how the human attaches to the pane" "$err" ;; esac
+case "$err" in *"wrapup $id"*) ok "and how the session is ended" ;;
+  *) bad "and how the session is ended" "$err" ;; esac
+case "$(TW create --help 2>&1)" in *--skill*) ok "create --help documents --skill" ;;
+  *) bad "create --help documents --skill" ;; esac
+case "$(TW create --help 2>&1)" in *brainstorm*) ok "create --help documents the brainstorm mode" ;;
+  *) bad "create --help documents the brainstorm mode" ;; esac
+
+# --pr is code work, not a dialogue
+out="$(TW create --repo widget --pr 7 --mode brainstorm --skill both --no-agent 2>&1)"; rc=$?
+is "--pr with --mode brainstorm is refused" "$rc" "1"
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
-SECTION_ORDER="5 16 18 8 20 6 17 15 7 9 11 2 19 12 3 1 14 4 10 13 21 0"
+SECTION_ORDER="5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 24 0"
 
 # ---------------------------------------------------------------------------
 # the runner

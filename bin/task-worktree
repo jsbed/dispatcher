@@ -10,6 +10,7 @@
 # Subcommands:
 #   create    Create worktree(s) + ephemeral task dir + spawn an executor agent.
 #   handoff   Swap in a fresh-context executor on an existing worktree/branch.
+#   wrapup    Ask a LIVE brainstorm session to produce its plan now (ends it).
 #   done      Executor self-notification: "I am finished" (PRIMARY completion path).
 #   watch     Detached settle watcher for one task (BACKSTOP; armed by create).
 #   report    Persist an executor's report durably.
@@ -47,6 +48,26 @@
 # A suppressed settle is still recorded ('paused' event, status
 # 'paused-by-human') so `list`/`reconcile` surface it, and it deliberately never
 # touches the settle claim, so the exactly-once gate cannot be poisoned.
+#
+# CONVERSATIONAL IDLE (--mode brainstorm)
+# A brainstorm session is a DIALOGUE with the human, so 'idle' is its resting
+# state: it is idle every time it finishes a turn and waits for the human to
+# type. Treating that as a settle would wake Dispatch on every conversational
+# turn and burn the exactly-once claim. So the SAME suppression grain as
+# human-interrupt is applied one step later, keyed on the classifier's cause:
+#   mode=brainstorm AND cause=completed  -> SUPPRESS (a finished turn == waiting
+#                                           for the human), recorded once per
+#                                           conversation as a 'conversing' event
+#                                           (status 'in-conversation').
+#   cause=agent-error / unknown / mid-tool -> WAKE, exactly as for any other
+#                                           task: the agent DYING is not a
+#                                           conversational pause.
+#   the agent vanishing entirely           -> WAKE (watch's --force path, which
+#                                           never classifies at all).
+# The suppression is lifted the moment `wrapup` is requested (ledger status
+# 'wrapping-up'), so the backstop still covers a session that produces its plan
+# and then forgets to call `done`. Like human-interrupt, a suppressed
+# conversational idle never touches the settle claim.
 #
 set -euo pipefail
 
@@ -540,19 +561,54 @@ PY
   ledger_append "{\"event\":\"resumed\",\"id\":\"$id\",\"status\":\"working\",\"reason\":\"$reason\",\"ts\":\"$(now)\"}"
 }
 
-# _record_pause <id> <by> <detail> <marker> — durably record a SUPPRESSED settle.
+# _last_status <id> -> the task's latest ledger status ("" if unknown).
+# Cheap: one pass over the append-only ledger, no herdr call.
+_last_status() {
+  python3 - "$LEDGER" "$1" <<'PY'
+import json, sys
+path, id_ = sys.argv[1], sys.argv[2]
+last = ""
+try:
+    for line in open(path):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if o.get("id") == id_ and o.get("status"):
+            last = o["status"]
+except OSError:
+    pass
+print(last)
+PY
+}
+
+# _record_suppressed <id> <by> <event> <status> <cause> <detail> <marker> <dedupe>
+#     durably record a SUPPRESSED settle.
 #
-# Suppressed is NOT invisible: the human interruption goes into the ledger as a
-# 'paused' event with status 'paused-by-human', so `list` shows it and
+# Suppressed is NOT invisible: it goes into the ledger so `list` shows it and
 # `reconcile` can re-examine it later. Deliberately does NOT touch the settle
 # claim, so the exactly-once gate shared with `done` cannot be poisoned.
-# De-duplicated on <marker> so a re-probing watcher/reconcile cannot spam the
-# ledger with one interruption.
-_record_pause() {
-  local id="$1" by="$2" detail="$3" marker="$4"
-  python3 - "$LEDGER" "$id" "$by" "$detail" "$marker" "$(now)" <<'PY'
+#
+# <dedupe> picks how repeats are collapsed, because the two suppressions repeat
+# for different reasons:
+#   marker  ONE record per distinct interruption — skip when the last event for
+#           this task is the same event with the same classifier marker (a
+#           re-probing watcher/reconcile must not spam the ledger).
+#   phase   ONE record per conversational phase — only record when the task is
+#           currently 'working'; a brainstorm session goes idle on EVERY turn,
+#           and each turn has its own marker, so marker-dedupe would append a
+#           line per turn. The phase re-opens when 'resumed'/'handoff' puts the
+#           task back to 'working'.
+_record_suppressed() {
+  local id="$1" by="$2" event="$3" status="$4" cause="$5" detail="$6" marker="$7" dedupe="$8"
+  python3 - "$LEDGER" "$id" "$by" "$event" "$status" "$cause" "$detail" "$marker" \
+                     "$dedupe" "$(_last_status "$id")" "$(now)" <<'PY'
 import json, sys
-ledger, id_, by, detail, marker, ts = sys.argv[1:7]
+(ledger, id_, by, event, status, cause, detail, marker, dedupe,
+ last_status, ts) = sys.argv[1:12]
 
 last = None
 try:
@@ -569,17 +625,34 @@ try:
 except OSError:
     pass
 
-# already recorded THIS interruption -> nothing new to say
-if last and last.get("event") == "paused" and marker and last.get("marker") == marker:
-    raise SystemExit(0)
+if dedupe == "marker":
+    # already recorded THIS interruption -> nothing new to say
+    if last and last.get("event") == event and marker and last.get("marker") == marker:
+        raise SystemExit(0)
+elif dedupe == "phase":
+    # the phase is already open (or the task has moved on to a settle/report/
+    # wrapup/teardown state) -> nothing new to say
+    if last_status != "working":
+        raise SystemExit(0)
 
 with open(ledger, "a") as fh:
     fh.write(json.dumps({
-        "event": "paused", "id": id_, "status": "paused-by-human",
-        "by": by, "cause": "human-interrupt", "suppressed": True,
+        "event": event, "id": id_, "status": status,
+        "by": by, "cause": cause, "suppressed": True,
         "detail": detail or None, "marker": marker or None, "ts": ts,
     }) + "\n")
 PY
+}
+
+# _record_pause <id> <by> <detail> <marker> — the HUMAN stopped the executor.
+_record_pause() {
+  _record_suppressed "$1" "$2" paused paused-by-human human-interrupt "$3" "$4" marker
+}
+
+# _record_conversing <id> <by> <detail> <marker> — a brainstorm session finished
+# a conversational turn and is waiting for the human to type. Normal, not news.
+_record_conversing() {
+  _record_suppressed "$1" "$2" conversing in-conversation conversational-idle "$3" "$4" phase
 }
 
 # _settle_forget <id> — drop all claim state (teardown).
@@ -609,6 +682,10 @@ Usage: task-worktree notify-settle <task-id> --by <executor|watcher|reconcile>
               + notification on positive evidence that the HUMAN stopped it
               (recording a durable 'paused' event instead). Used by the backstop
               watcher and reconcile; never by the executor's own 'done'.
+              In --mode brainstorm it ALSO suppresses a plain finished turn
+              (cause 'completed'), because idle is the resting state of a
+              dialogue; that is recorded once as a 'conversing' event. Agent
+              errors and anything ambiguous still wake, in every mode.
               Set TASK_SETTLE_CLASSIFY=0 to disable (always wake).
 EOF
 }
@@ -655,6 +732,24 @@ cmd_notify_settle() {
       _record_pause "$id" "$by" "$detail" "$marker"
       [ "$quiet" -eq 1 ] || \
         info "settle for $id classified as human-interrupt — wake suppressed ($detail)"
+      return 0
+    fi
+    # CONVERSATIONAL IDLE. A brainstorm session is a dialogue: a turn that ended
+    # normally means "waiting for the human to type", not "finished". Same grain
+    # as the human-interrupt suppression above — record it, do not wake, do not
+    # notify, do not claim — and deliberately NARROW:
+    #   * only cause 'completed' (a clean end-of-turn). agent-error, mid-tool
+    #     and every 'unknown' fall through and wake, so a session whose AGENT
+    #     dies is still reported loudly.
+    #   * only while the task has not been asked to wrap up. Once `wrapup` has
+    #     been requested the dialogue is over, so the backstop is live again and
+    #     covers a session that writes its plan but forgets to call `done`.
+    if [ "$cause" = "completed" ] \
+       && [ "$(_task_field "$id" mode)" = "brainstorm" ] \
+       && [ "$(_last_status "$id")" != "wrapping-up" ]; then
+      _record_conversing "$id" "$by" "$detail" "$marker"
+      [ "$quiet" -eq 1 ] || \
+        info "settle for $id is a brainstorm conversational pause — wake suppressed ($detail)"
       return 0
     fi
     [ "$quiet" -eq 1 ] || info "settle for $id classified as '${cause:-unknown}' — waking ($detail)"
@@ -823,6 +918,11 @@ Usage: task-worktree watch <task-id> [--dispatch-pane <pane>] [--compare <url>]
   the HUMAN stopping the executor is recorded as 'paused-by-human' and does NOT
   wake Dispatch, while completions, blocks, agent errors and anything ambiguous
   do. The watcher stays armed either way.
+
+  In --mode brainstorm a plain finished turn is ALSO suppressed (the session is
+  a dialogue, so idle is its resting state; it is recorded once as
+  'in-conversation'). Agent errors, a vanished agent, and anything ambiguous
+  still wake — the session DYING is not a conversational pause.
 EOF
 }
 
@@ -981,6 +1081,8 @@ cmd_watch() {
       >>"$WATCH_LOG" 2>&1 || _watch_log "warning: notify-settle failed (see above)"
     [ "$cause" = "human-interrupt" ] && \
       _watch_log "wake SUPPRESSED (human interrupt); recorded as paused-by-human, staying armed"
+    [ "$cause" = "completed" ] && [ "$(_task_field "$id" mode)" = "brainstorm" ] && \
+      _watch_log "wake possibly SUPPRESSED (brainstorm conversational pause); staying armed"
 
     # RE-ARM: park until the executor genuinely resumes work, then release the
     # settle claim so the NEXT settle reports again.
@@ -1054,10 +1156,16 @@ Fix it with ONE of:
 Then re-run this command."
 }
 
-# _done_brief <id> <compare-url> -> the completion contract appended to every
-# executor briefing, so the executor always knows how to reach Dispatch.
+# _done_brief <id> <compare-url> [mode] -> the completion contract appended to
+# every executor briefing, so the executor always knows how to reach Dispatch.
 _done_brief() {
-  local id="$1" compare="${2:-}"
+  local id="$1" compare="${2:-}" mode="${3:-code}"
+  if [ "$mode" = "brainstorm" ]; then
+    printf '%s\n' "Your task id is $id (also in ./task.env). This is a BRAINSTORM session: you are in a dialogue with a human and you do NOT commit, push or open PRs. Going idle between turns is normal and reports nothing. ONLY when the human ends the session (they say to write it up, or a wrap-up request arrives from Dispatch) do you deliver the plan — that delivery is your FINAL action:
+  $SELF done $id --note \"<one-line summary of the plan>\" --body-file <path-to-your-plan.md>
+(use --blocked instead if you are stopping blocked). Never run 'herdr agent prompt' by hand."
+    return 0
+  fi
   printf '%s' "Your task id is $id (also in ./task.env). When you are finished — after committing and pushing — your FINAL action MUST be to tell Dispatch yourself:
   $SELF done $id --note \"<one-line summary>\" [--pr <url>] [--body-file <path-to-your-report.md>]
 (use --blocked instead of finishing if you are stopping blocked). Never run 'herdr agent prompt' by hand."
@@ -1119,6 +1227,61 @@ PY
 }
 
 AUTOPILOT_PROMPT="$DISPATCH_DIR/autopilot.PROMPT.md"
+BRAINSTORM_PROMPT="$DISPATCH_DIR/brainstorm.PROMPT.md"
+
+# _skill_fragment <skill> -> path of the guidance fragment for one skill
+_skill_fragment() { printf '%s/brainstorm.skill-%s.md\n' "$DISPATCH_DIR" "$1"; }
+
+# _brainstorm_prompt <task-id> <repo> <branch> <skills> -> the rendered brief.
+#
+# brainstorm.PROMPT.md is only the SHARED FRAME (it is a dialogue, one question
+# at a time, read the code before asserting, the wrap-up format). The actual
+# working method is composed in from the SELECTED skills' fragments, so a
+# grill-only session is a grilling session rather than a brainstorm wearing a
+# grill hat.
+_brainstorm_prompt() {
+  local id="$1" repo="$2" branch="$3" skills="$4" guidance="" s f
+  [ -f "$BRAINSTORM_PROMPT" ] \
+    || die "create: --mode brainstorm needs the prompt template at $BRAINSTORM_PROMPT (or pass --prompt)"
+  for s in $(_skill_list "$skills"); do
+    f="$(_skill_fragment "$s")"
+    [ -f "$f" ] || die "create: missing skill guidance fragment for '--skill $s': $f"
+    guidance="$guidance$(cat "$f")
+
+"
+  done
+  python3 - "$BRAINSTORM_PROMPT" "$id" "$repo" "$branch" "$skills" "$guidance" <<'PY'
+import sys
+path, tid, repo, branch, skills, guidance = sys.argv[1:7]
+with open(path) as fh:
+    text = fh.read()
+for k, v in (("TASK_ID", tid), ("REPO", repo), ("BRANCH", branch),
+             ("SKILLS", skills), ("SKILL_GUIDANCE", guidance.rstrip() + "\n")):
+    text = text.replace("{{%s}}" % k, v)
+sys.stdout.write(text)
+PY
+}
+
+# _skill_list <selection> -> the skill fragment names the selection expands to
+_skill_list() {
+  case "$1" in
+    both) printf 'brainstorm grill\n' ;;
+    *)    printf '%s\n' "$1" ;;
+  esac
+}
+
+# _require_skill_choice <selection> — a brainstorm session's NATURE is the
+# human's call, never Dispatch's, so there is deliberately NO default here.
+_require_skill_choice() {
+  case "${1:-}" in
+    brainstorm|grill|both) return 0 ;;
+    '') die "create: --mode brainstorm requires an explicit --skill <brainstorm|grill|both>.
+DISPATCH: STOP AND ASK THE HUMAN which skills this session should use — do NOT
+choose on their behalf and do NOT default to 'both'. Ask: 'brainstorming, grilling,
+or both?', then re-run create with their answer." ;;
+    *) die "create: --skill must be 'brainstorm', 'grill' or 'both' (got '$1')" ;;
+  esac
+}
 
 # _autopilot_prompt <repo> <pr-number> <pr-url> <branch> -> the rendered brief
 _autopilot_prompt() {
@@ -1158,6 +1321,14 @@ Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
   --mode     Task lifecycle (default: 'code'):
                code        touches the tree; stays open for review, closed later.
                investigate read-only find/answer; reports and auto-closes itself.
+               brainstorm  a LIVE dialogue the HUMAN drives in the session's own
+                           pane. Idle is its resting state, so it never wakes
+                           Dispatch on a conversational turn; it ends when the
+                           human says so (or via 'wrapup'), delivers a plan to
+                           reports/<id>.md, and then auto-closes.
+  --skill    REQUIRED with --mode brainstorm, and only valid there. Which skills
+             the session is briefed with: 'brainstorm', 'grill' or 'both'.
+             There is no default on purpose: ASK THE HUMAN which they want.
   --agent    Executor agent kind (default: \$TASK_AGENT_KIND or 'pi').
   --request  Your original request, recorded in the ledger.
   --prompt   Opening instruction handed to the executor agent.
@@ -1167,11 +1338,12 @@ EOF
 
 cmd_create() {
   local slug="" branch="" base="" agent="$DEFAULT_AGENT_KIND"
-  local request="" prompt="" no_agent=0 mode="code" pr=""
+  local request="" prompt="" no_agent=0 mode="code" pr="" skills=""
   local -a repos=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
+      --skill)   skills="$2"; shift 2 ;;
       --slug)    slug="$2"; shift 2 ;;
       --repo)    repos+=("$2"); shift 2 ;;
       --branch)  branch="$2"; shift 2 ;;
@@ -1189,9 +1361,18 @@ cmd_create() {
 
   [ "${#repos[@]}" -gt 0 ] || { usage_create; die "create: at least one --repo required"; }
   case "$mode" in
-    code|investigate) ;;
-    *) die "create: --mode must be 'code' or 'investigate' (got '$mode')" ;;
+    code|investigate|brainstorm) ;;
+    *) die "create: --mode must be 'code', 'investigate' or 'brainstorm' (got '$mode')" ;;
   esac
+
+  # The skill selection is validated BEFORE anything is created, so a session
+  # whose nature was never chosen never gets a worktree.
+  if [ "$mode" = "brainstorm" ]; then
+    [ -z "$pr" ] || die "create: --pr cannot be combined with --mode brainstorm (a PR is code work, not a dialogue)"
+    _require_skill_choice "$skills"
+  else
+    [ -z "$skills" ] || die "create: --skill only applies to --mode brainstorm (got --mode $mode)"
+  fi
 
   # --pr: resolve the PR FIRST, so nothing is created for a PR we will refuse.
   if [ -n "$pr" ]; then
@@ -1230,7 +1411,13 @@ cmd_create() {
     _resolve_repo "$repo"
   done
 
-  info "task id: $id  branch: $branch  mode: $mode  repos: ${repos[*]}"
+  # The brainstorm brief needs the id/branch, so it is rendered here — still
+  # before any worktree exists, so a broken template fails cheaply.
+  if [ "$mode" = "brainstorm" ] && [ -z "$prompt" ]; then
+    prompt="$(_brainstorm_prompt "$id" "${repos[0]}" "$branch" "$skills")"
+  fi
+
+  info "task id: $id  branch: $branch  mode: $mode  repos: ${repos[*]}${skills:+  skills: $skills}"
 
   local task_dir="$TASKS_DIR/$id"
   [ -e "$task_dir" ] && die "task dir already exists: $task_dir"
@@ -1305,6 +1492,7 @@ cmd_create() {
 TASK_ID="$id"
 TASK_SLUG="$slug"
 TASK_MODE="$mode"
+TASK_SKILLS="$skills"
 TASK_BRANCH="$branch"
 TASK_PRIMARY_REPO="$primary"
 TASK_REPOS="${repos[*]}"
@@ -1333,7 +1521,7 @@ EOF
       local full="$prompt
 
 Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch).
-$(_done_brief "$id" "$task_compare")"
+$(_done_brief "$id" "$task_compare" "$mode")"
       herdr agent prompt "$id" "$full" >/dev/null 2>&1 \
         || info "warning: agent prompt submission failed; brief the agent manually"
     fi
@@ -1350,6 +1538,23 @@ $(_done_brief "$id" "$task_compare")"
       >>"$LOG_DIR/watch-$id.log" 2>&1 &
     disown 2>/dev/null || true
     info "backstop watcher armed for $id (log: .dispatch/logs/watch-$id.log); primary path is the executor's own 'done'"
+
+    # A brainstorm session is USELESS unless the human can reach it: the whole
+    # mode is "talk to this agent yourself". So say exactly how, loudly.
+    if [ "$mode" = "brainstorm" ]; then
+      cat >&2 <<EOF
+
+💬 brainstorm session '$id' is LIVE (skills: $skills) and waiting for the HUMAN.
+   It is a dialogue — nobody reports until you end it. Attach to its pane:
+
+     herdr agent focus $id        # jump to it in the current herdr session
+     herdr agent attach $id       # or attach directly to its terminal
+
+   pane: $exec_pane   workspace: $exec_wsid
+   End it by telling the session to write it up, or (on the HUMAN's word only):
+     $SELF wrapup $id
+EOF
+    fi
   fi
 
 
@@ -1358,14 +1563,15 @@ $(_done_brief "$id" "$task_compare")"
   local entry
   entry="$(python3 - "$id" "$slug" "$branch" "$primary" "$agent" \
                     "$request" "$prompt" "$exec_wsid" "$mode" "$(now)" "$wts" \
-                    "$dispatch_pane" "$task_compare" "$PR_NUMBER" "$PR_URL" <<'PY'
+                    "$dispatch_pane" "$task_compare" "$PR_NUMBER" "$PR_URL" "$skills" <<'PY'
 import json, sys
 (id_, slug, branch, primary, agent, request, prompt, exec_ws, mode, ts, wts,
- pane, compare, pr_num, pr_url) = sys.argv[1:16]
+ pane, compare, pr_num, pr_url, skills) = sys.argv[1:17]
 print(json.dumps({
     "event": "created",
     "id": id_, "slug": slug, "branch": branch, "primary_repo": primary,
-    "agent_kind": agent, "mode": mode, "request": request, "prompt": prompt,
+    "agent_kind": agent, "mode": mode, "skills": skills or None,
+    "request": request, "prompt": prompt,
     "executor_workspace_id": exec_ws or None,
     "dispatch_pane": pane or None, "compare": compare or None,
     "pr_number": int(pr_num) if pr_num else None, "pr_url": pr_url or None,
@@ -1570,7 +1776,7 @@ $note
   full="$full
 
 Read ./AGENTS.md first — it defines how you must operate as a task executor. Primary repo: $primary (branch $branch).
-$(_done_brief "$id" "$ho_compare")"
+$(_done_brief "$id" "$ho_compare" "$mode")"
   herdr agent prompt "$id" "$full" >/dev/null 2>&1 \
     || info "warning: agent prompt submission failed; brief the agent manually"
 
@@ -1605,6 +1811,7 @@ print(json.dumps({
     "primary_repo": o.get("primary_repo"),
     "agent_kind": o.get("agent_kind"),
     "mode": o.get("mode") or "code",
+    "skills": o.get("skills"),
     "request": o.get("request"),
     "prompt": prompt,
     "handoff_note": note or None,
@@ -1627,6 +1834,93 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# wrapup — ask a LIVE brainstorm session to produce its plan now
+#
+# This is the SECOND of the two ways a brainstorm session ends (the first is the
+# human simply telling the session "write it up" in its own pane). It is
+# deliberately NOT a second reporting mechanism: all it does is prompt the live
+# session, which then delivers the plan through the ordinary executor `done`
+# path — same settle claim, same exactly-once wake, same durable report.
+#
+# It also flips the task's ledger status to 'wrapping-up', which LIFTS the
+# conversational-idle suppression (see notify-settle): from here on, an idle
+# session is news again, so the backstop still catches a session that writes its
+# plan and then forgets to call `done`.
+# ---------------------------------------------------------------------------
+usage_wrapup() {
+  cat >&2 <<EOF
+Usage: task-worktree wrapup <task-id> [--note "<extra steer>"]
+
+  Asks a LIVE --mode brainstorm session to stop asking questions and write up
+  its plan NOW. The session delivers it through the normal 'done' path, so
+  Dispatch is woken exactly once, the plan is persisted under reports/, and the
+  task then auto-closes on 'report'.
+
+  ONLY run this when the HUMAN explicitly says to wrap the session up. Dispatch
+  must never decide on its own that a conversation is finished — it is the
+  human's dialogue, and an interrupted one loses the un-asked questions.
+
+  --note  Extra steer folded into the request (e.g. "focus on the migration").
+EOF
+}
+
+cmd_wrapup() {
+  local id="" note=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --note)    note="$2"; shift 2 ;;
+      -h|--help) usage_wrapup; return 0 ;;
+      -*) die "wrapup: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "wrapup: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_wrapup; die "wrapup: task id required"; }
+
+  local rec; rec="$(_find_created_rec "$id")"
+  [ -n "$rec" ] || die "wrapup: no ledger record for task '$id'"
+  local mode; mode="$(jget "$rec" "d.get('mode') or 'code'")"
+  [ "$mode" = "brainstorm" ] \
+    || die "wrapup: task '$id' is --mode $mode; wrapup only applies to --mode brainstorm sessions.
+A $mode task ends when its executor calls 'done' — steer it with a prompt, or close it with 'remove'."
+
+  local live; live="$(_agent_status "$id")"
+  [ -n "$live" ] \
+    || die "wrapup: no live agent for '$id' — the session is gone. Its plan was never delivered; check 'list'/'reconcile', then close it with 'remove'."
+
+  local skills; skills="$(jget "$rec" "d.get('skills') or ''")"
+  info "wrapup: asking brainstorm session $id (skills: ${skills:-?}, agent: $live) for its plan"
+
+  # 1. Record the request FIRST. This is what lifts the conversational-idle
+  #    suppression, so it must be durable before the session can go idle again.
+  ledger_append "$(python3 - "$id" "$note" "$(now)" <<'PY'
+import json, sys
+id_, note, ts = sys.argv[1:4]
+print(json.dumps({"event": "wrapup-requested", "id": id_,
+                  "status": "wrapping-up", "note": note or None, "ts": ts}))
+PY
+)"
+
+  # 2. Prompt the live session. Same wording as the template's wrap-up section,
+  #    so both endings land the session in exactly the same place.
+  local ask="WRAP-UP REQUEST from the human (via Dispatch). Stop asking questions now and write up the plan.
+
+Produce a single markdown file in your task dir (e.g. ./PLAN.md) with these sections, in this order: 'Decided' (what we settled and why), 'Rejected' (what we considered and did NOT do, each with the reason), 'Open questions' (what is still undecided and what would settle it), and 'Next tasks' (concrete tasks Dispatch could spawn: slug, repo, mode, two-line brief — each sized for one executor).
+
+Then, as your FINAL action, deliver it:
+  $SELF done $id --note \"<one-line summary of the plan>\" --body-file <path-to-that-file>
+
+This task auto-closes once the plan is persisted, so anything not in that file is lost — do not leave conclusions in the worktree or in chat."
+  [ -n "$note" ] && ask="$ask
+
+Extra steer from the human: $note"
+
+  herdr agent prompt "$id" "$ask" >/dev/null 2>&1 \
+    || die "wrapup: could not prompt the session '$id' — it may have died; check 'list'/'reconcile'"
+
+  info "wrapup requested for $id — it will report through the normal 'done' path (one wake), then auto-close on 'report'"
+}
+
+# ---------------------------------------------------------------------------
 # report
 # ---------------------------------------------------------------------------
 usage_report() {
@@ -1637,9 +1931,10 @@ Usage: task-worktree report <task-id> [--status <status>] [--note <text>]
   Persists the executor's report DURABLY — first to reports/<id>.md, then as a
   'reported' ledger event — BEFORE any teardown, so it can never be lost.
 
-  If the task was created with --mode investigate, it then auto-closes itself
-  (teardown + branch delete, nothing to review). A --mode code task is left open
-  at its report status for human review and explicit 'remove' later.
+  If the task was created with --mode investigate or --mode brainstorm, it then
+  auto-closes itself (teardown + branch delete, nothing to review — the report
+  IS the deliverable). A --mode code task is left open at its report status for
+  human review and explicit 'remove' later.
 
   --status   Report status (default: awaiting-review).
   --note     One-line summary recorded in the ledger.
@@ -1713,9 +2008,10 @@ PY
 )"
   ledger_append "$entry"
 
-  # 3. Investigate tasks auto-close (report is already safely persisted).
-  if [ "$mode" = "investigate" ]; then
-    info "mode=investigate → auto-closing $id"
+  # 3. Investigate and brainstorm tasks auto-close: their whole deliverable is
+  #    the report, which is already safely persisted above.
+  if [ "$mode" = "investigate" ] || [ "$mode" = "brainstorm" ]; then
+    info "mode=$mode → auto-closing $id (the plan/report is durable at reports/$id.md)"
     _teardown_from_rec "$rec" 1 "$id"
   else
     info "mode=code → task $id left open at '$status' for review"
@@ -1901,6 +2197,17 @@ for tid in order:
         tail = "(stopped by you — steer it or let it resume) " + tail
     elif o.get("cause") == "agent-error" and o.get("event") == "settled":
         tail = "(settled on an AGENT/PROVIDER ERROR) " + tail
+    # A brainstorm session is a DIALOGUE: idle means "waiting for you to type",
+    # never "stalled". Say so, and say what it is, so its nature survives the
+    # conversation.
+    if o.get("mode") == "brainstorm":
+        skills = o.get("skills") or "?"
+        if status == "in-conversation":
+            tail = f"(IN CONVERSATION · skills: {skills} · talk to it: herdr agent focus {tid}) " + tail
+        elif status == "wrapping-up":
+            tail = f"(wrapping up · skills: {skills} · writing its plan) " + tail
+        elif status == "working":
+            tail = f"(brainstorm session · skills: {skills}) " + tail
     print(f"{tid:<{w}}  {status:<16}  {repos:<20}  {tail[:70]}")
 PY
 }
@@ -1912,13 +2219,15 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|handoff|done|report|classify|reconcile|remove|prune|list|help> [args]
+Usage: task-worktree <create|handoff|wrapup|done|report|classify|reconcile|remove|prune|list|help> [args]
 
   create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
+            --mode code | investigate | brainstorm (brainstorm needs --skill).
   handoff   Baton-pass a task to a FRESH-context executor (same worktree/branch).
+  wrapup    Ask a live --mode brainstorm session for its plan NOW (human's word only).
   done      (EXECUTORS) "I am finished" — record + notify + wake Dispatch.
   watch     Detached settle backstop for one task (armed automatically).
-  report    Persist an executor's report durably; auto-close if --mode investigate.
+  report    Persist a report durably; auto-close if --mode investigate/brainstorm.
   classify  Why did an executor settle? (human /stop vs finished vs crashed)
   reconcile Repair ledger status from live herdr agent state.
 
@@ -1935,6 +2244,7 @@ main() {
   case "$cmd" in
     create) cmd_create "$@" ;;
     handoff) cmd_handoff "$@" ;;
+    wrapup) cmd_wrapup "$@" ;;
     done)   cmd_done "$@" ;;
     watch)  cmd_watch "$@" ;;
     notify-settle) cmd_notify_settle "$@" ;;

@@ -32,9 +32,10 @@ Everything goes through `bin/task-worktree <verb>`. Nothing here blocks except
 |---|---|---|
 | `create` | you | worktree(s) + task dir + executor agent + backstop watcher. Prints the task id. |
 | `handoff <id>` | you | same worktree/branch, brand-new empty-context executor. |
+| `wrapup <id>` | you, **on the human's word only** | ask a live `brainstorm` session for its plan now; it reports through the normal path and then auto-closes. |
 | `list` | you | instant task status from the ledger. **Your primary view.** |
 | `reconcile [id]` | you | repair ledger status from live herdr state (`--dry-run`, `--no-wake`). |
-| `report <id>` | you | persist the executor's report durably; auto-closes `investigate` tasks. |
+| `report <id>` | you | persist the executor's report durably; auto-closes `investigate` and `brainstorm` tasks. |
 | `remove <id>` | you | teardown (`--delete-branch` optional). Explicit command only. |
 | `prune` | you | drop dangling symlinks. |
 | `classify <id>` | you (debug) | *why* an agent is idle: `human-interrupt` / `completed` / `agent-error` / `unknown`. |
@@ -56,7 +57,7 @@ bin/task-worktree create \
   --repo <repo> [--repo <other-repo> ...] \
   --request "<the human's words>" \
   --prompt "<clear opening instruction for the executor>" \
-  [--branch <name>] [--base <ref>] [--mode code|investigate] [--agent <kind>]
+  [--branch <name>] [--base <ref>] [--mode code|investigate|brainstorm] [--agent <kind>]
 ```
 
 - The **slug** becomes `slug-<nonce>` (the task id) — reused for the branch, the
@@ -66,8 +67,12 @@ bin/task-worktree create \
     for the human to review, and is closed later on explicit command.
   - `investigate` — read-only "find me X / answer this" work. After it reports,
     it **auto-closes itself** (teardown + branch delete, nothing to review).
+  - `brainstorm` — a **live dialogue the human drives themselves** (see below).
+    It is idle most of the time, never wakes you for a conversational turn, and
+    ends only on the human's word — producing a plan, then auto-closing.
   Pick `investigate` for pure inspection/answers; pick `code` for anything that
-  changes files.
+  changes files; pick `brainstorm` when the human wants to *think something
+  through* with an agent before any work is spawned.
 - First `--repo` is the **primary**; add more only for genuinely cross-cutting work.
 - **Always start from the latest main tip.** By default `create` fetches each
   repo's `origin/<main>` and branches off that fresh tip — never a stale local
@@ -111,6 +116,61 @@ the task and the executor runs the loop.
   executor pushes to the PR branch; it never merges, auto-merges or marks the PR
   ready.
 
+### Brainstorm: "let's think this through first"
+
+When the human wants to *design* or *stress-test* something before any work is
+spawned — "let's brainstorm X", "grill me on this plan" — spin a **`brainstorm`**
+session. It is the one mode where **the human talks to the agent directly**, in
+the session's own pane. You are not in the loop during the conversation.
+
+```
+bin/task-worktree create --slug "<short-slug>" --repo core \
+  --mode brainstorm --skill <brainstorm|grill|both> \
+  --request "<the human's words>"
+```
+
+- **ASK THE HUMAN WHICH SKILLS, ALWAYS.** `--skill` has **no default** and
+  `create` refuses to run without it. Ask literally: *"brainstorming, grilling,
+  or both?"* — brainstorming turns an idea into a design, grilling interrogates
+  a plan round by round. **Never choose on their behalf, and never pass `both`
+  because you weren't sure.** The selection shapes the whole session; it is
+  recorded in the ledger, in `task.env` and in `list`.
+- It gets a **real worktree** off the fresh main tip (same as every other task)
+  so the session can read actual code, but it **never commits or pushes**.
+- Do **not** pass `--prompt`: the brief is composed from
+  `.dispatch/brainstorm.PROMPT.md` (the shared dialogue frame) plus the selected
+  skills' fragments. A hand-written prompt throws that away.
+- **Tell the human how to reach it.** `create` prints the attach commands
+  (`herdr agent focus <id>` / `herdr agent attach <id>`) — surface them
+  immediately, because a session nobody attaches to is useless.
+- **It will not wake you while it is talking.** A brainstorm session is idle
+  between every turn; that is recorded once as `in-conversation` and is
+  deliberately **not** a settle. You get **exactly one** wake: when the plan is
+  delivered. If its *agent* dies or errors, you are still woken loudly — that is
+  not a conversational pause.
+- `list` shows it as `in-conversation` with its skills. That is **healthy**, not
+  stalled. Never "repair" it, never steer it, never reconcile it into a settle.
+
+**Ending it — the human's call, never yours.** Two paths, same machinery:
+
+1. The human tells the session directly ("write it up") in its pane.
+2. The human tells **you** to wrap it up, and only then you run:
+
+   ```
+   bin/task-worktree wrapup <id> [--note "<extra steer>"]
+   ```
+
+**You must NEVER decide a brainstorm session is finished.** Not because it has
+been idle a long time, not because the conversation "looks done", not because
+you think it has enough material. An interrupted dialogue loses the questions
+that were never asked. `wrapup` fires **only** on an explicit human command.
+
+Either way the session delivers its plan through the ordinary `done` path (one
+wake), you persist it with `report --body-file reports/<id>.executor.md`, and the
+task then **auto-closes** like `investigate` — the plan lives at
+`reports/<id>.md`. Its "Next tasks" section is the human's menu of what to spawn
+next: surface it, and **wait for them to pick** — do not auto-spawn from it.
+
 ## What lives where
 
 ```
@@ -121,6 +181,10 @@ tasks/<id>/                 ephemeral, symlink-only executor workspace
   AGENTS.md -> executor context
 .dispatch/ledger.jsonl      append-only intent + status log (source of "why")
 .dispatch/task-executor.AGENTS.md   the executor contract
+.dispatch/autopilot.PROMPT.md       the --pr (autopilot) brief
+.dispatch/brainstorm.PROMPT.md      the brainstorm dialogue frame
+.dispatch/brainstorm.skill-*.md     per-skill guidance composed into that frame
+reports/<id>.md             the durable report/plan (survives teardown)
 bin/task-worktree           this blessed script
 ```
 
@@ -205,6 +269,8 @@ bin/task-worktree           this blessed script
 - **What `report` does with the task depends on its mode:**
   - `investigate` — `report` **auto-closes it** (teardown + branch delete) right
     after persisting. Nothing left to clean up manually.
+  - `brainstorm` — same auto-close as `investigate`: the plan at `reports/<id>.md`
+    *is* the deliverable, and the worktree/branch are thrown away.
   - `code` — `report` leaves the task **open** at `awaiting-review` with the
     worktree in place for the human to review in Cursor; close it later on
     explicit command. Executors **commit and push their own branch by default**
