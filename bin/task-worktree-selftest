@@ -481,6 +481,23 @@ stop_watchers() {
 state() { printf '%s %s\n' "$2" "${3:-$((RANDOM + 1000))}" > "$HERDR_STUB_STATE/$1"; }
 # seq_state <agent> <status> <seq>  — explicit, monotonic
 seq_state() { printf '%s %s\n' "$2" "$3" > "$HERDR_STUB_STATE/$1"; }
+# --- durable report paths --------------------------------------------------
+# Reports are named reports/<YYYY-MM-DD>-<id>.md, dated with the TASK'S
+# CREATION date (the first 'created' record). setup()'s fixture ledger carries
+# ts "x", which is not a timestamp, so the script falls back to today — which
+# is what these helpers reproduce. Sections that pin a specific creation date
+# use dated_ledger + local_date below.
+local_date() {   # <utc-ts> -> the LOCAL YYYY-MM-DD the script will use
+  python3 -c 'import sys;from datetime import datetime
+t=sys.argv[1]
+t=t[:-1]+"+00:00" if t.endswith("Z") else t
+print(datetime.fromisoformat(t).astimezone().strftime("%Y-%m-%d"))' "$1"
+}
+rep_md()   { printf '%s/reports/%s-%s.md\n'          "$SANDBOX" "${2:-$(date +%Y-%m-%d)}" "${1:-$AID}"; }
+rep_exec() { printf '%s/reports/%s-%s.executor.md\n' "$SANDBOX" "${2:-$(date +%Y-%m-%d)}" "${1:-$AID}"; }
+# every report file this sandbox holds for <id>, dated or not
+rep_all()  { ls "$SANDBOX/reports/" 2>/dev/null | grep -c -- "${1:-$AID}" | tr -d ' '; }
+
 settles() { grep -c '"event":[ ]*"settled"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
 wakes()   { grep -c '^PROMPT' "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
 ledger()  { cat "$SANDBOX/.dispatch/ledger.jsonl"; }
@@ -761,8 +778,8 @@ is "and records nothing" "$(settles)" "0"
 setup; seq_state "$AID" working 112
 printf 'full body\n' > "$TMPROOT/body.md"
 TW done "$AID" --note n --pr "https://x/pr/1" --body-file "$TMPROOT/body.md" >/dev/null 2>&1
-if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then ok "--body-file is persisted to reports/<id>.executor.md"
-else bad "--body-file is persisted to reports/<id>.executor.md"; fi
+if [ -f "$(rep_exec)" ]; then ok "--body-file is persisted to reports/<date>-<id>.executor.md"
+else bad "--body-file is persisted to reports/<date>-<id>.executor.md" "$(ls "$SANDBOX/reports")"; fi
 if grep -q 'https://x/pr/1' "$HERDR_STUB_LOG"; then ok "the PR url reaches the Dispatch wake"
 else bad "the PR url reaches the Dispatch wake" "$(cat "$HERDR_STUB_LOG")"; fi
 }
@@ -1169,17 +1186,17 @@ seq_state "$AID" working 244
 TW done "$AID" --note "plan delivered" --body-file "$SANDBOX/plan.md" >/dev/null 2>&1
 is "the session's 'done' records exactly one settle" "$(settles)" "1"
 is "and wakes Dispatch exactly once" "$(dwakes)" "1"
-if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then ok "the plan is durable at reports/<id>.executor.md"
-else bad "the plan is durable at reports/<id>.executor.md"; fi
+if [ -f "$(rep_exec)" ]; then ok "the plan is durable at reports/<date>-<id>.executor.md"
+else bad "the plan is durable at reports/<date>-<id>.executor.md" "$(ls "$SANDBOX/reports")"; fi
 
 # Dispatch persists it -> exactly one report, and the task auto-closes
 TW report "$AID" --status awaiting-review --note "the plan" \
-  --body-file "$SANDBOX/reports/$AID.executor.md" >/dev/null 2>&1
+  --body-file "$(rep_exec)" >/dev/null 2>&1
 is "report writes exactly one report event" "$(reports_n)" "1"
-if [ -f "$SANDBOX/reports/$AID.md" ]; then ok "the plan lands at reports/<id>.md"
-else bad "the plan lands at reports/<id>.md"; fi
-case "$(cat "$SANDBOX/reports/$AID.md")" in *'## Decided'*) ok "and it is the session's own plan" ;;
-  *) bad "and it is the session's own plan" "$(cat "$SANDBOX/reports/$AID.md")" ;; esac
+if [ -f "$(rep_md)" ]; then ok "the plan lands at reports/<date>-<id>.md"
+else bad "the plan lands at reports/<date>-<id>.md" "$(ls "$SANDBOX/reports")"; fi
+case "$(cat "$(rep_md)")" in *'## Decided'*) ok "and it is the session's own plan" ;;
+  *) bad "and it is the session's own plan" "$(cat "$(rep_md)")" ;; esac
 if grep -q '"event": *"closed"' "$SANDBOX/.dispatch/ledger.jsonl"; then
   ok "the task AUTO-CLOSES on report (like investigate)"
 else bad "the task AUTO-CLOSES on report (like investigate)" "$(ledger | tail -1)"; fi
@@ -1347,12 +1364,83 @@ case "$(TW help 2>&1)" in *autopilot*) ok "the top-level usage lists autopilot" 
   *) bad "the top-level usage lists autopilot" ;; esac
 }
 
+# ===========================================================================
+sect_27() {
+section "26. durable reports are dated by the task's CREATION date"
+AID="dated-reports-zzz"
+CREATED_TS="2025-03-04T18:30:00Z"
+LATER_TS="2025-06-09T18:30:00Z"
+D0="$(local_date "$CREATED_TS")"
+D1="$(local_date "$LATER_TS")"
+
+# a ledger whose 'created' record carries a REAL timestamp
+dated_ledger() {
+  printf '%s\n' "{\"event\":\"created\",\"id\":\"$AID\",\"slug\":\"demo\",\"branch\":\"demo\",\"primary_repo\":\"none\",\"mode\":\"code\",\"dispatch_pane\":\"wDISPATCH:p1\",\"status\":\"working\",\"ts\":\"$CREATED_TS\"}" \
+    > "$SANDBOX/.dispatch/ledger.jsonl"
+}
+body() { printf '# body\n' > "$SANDBOX/body.md"; printf '%s' "$SANDBOX/body.md"; }
+
+# --- the prefix is the creation date, and both files share it ---------------
+setup; dated_ledger; seq_state "$AID" working 260
+TW done "$AID" --note n --body-file "$(body)" >/dev/null 2>&1
+if [ -f "$(rep_exec "$AID" "$D0")" ]; then ok "the executor report is reports/$D0-<id>.executor.md"
+else bad "the executor report is reports/$D0-<id>.executor.md" "$(ls "$SANDBOX/reports")"; fi
+TW report "$AID" --note n --body "x" >/dev/null 2>&1
+if [ -f "$(rep_md "$AID" "$D0")" ]; then ok "the final report is reports/$D0-<id>.md"
+else bad "the final report is reports/$D0-<id>.md" "$(ls "$SANDBOX/reports")"; fi
+is "the task has exactly two report files" "$(rep_all "$AID")" "2"
+if [ "$(ls "$SANDBOX/reports" | sed 's/-'"$AID"'.*//' | sort -u)" = "$D0" ]; then
+  ok "and both halves of the task share ONE prefix"
+else bad "and both halves of the task share ONE prefix" "$(ls "$SANDBOX/reports")"; fi
+is "the prefix is strictly YYYY-MM-DD" \
+  "$(ls "$SANDBOX/reports" | grep -c '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-' | tr -d ' ')" "2"
+
+# --- the path the LEDGER and the WAKE name is the path on disk -------------
+if grep -q "reports/$D0-$AID.executor.md" "$SANDBOX/.dispatch/ledger.jsonl"; then
+  ok "the ledger records the dated path"
+else bad "the ledger records the dated path" "$(ledger | tail -2)"; fi
+if grep -q "reports/$D0-$AID.executor.md" "$HERDR_STUB_LOG"; then
+  ok "and the wake tells Dispatch the same dated path"
+else bad "and the wake tells Dispatch the same dated path" "$(cat "$HERDR_STUB_LOG")"; fi
+
+# --- a SECOND settle rewrites the same file, it does not make a new one -----
+seq_state "$AID" working 261
+TW done "$AID" --force --note "round two" --body-file "$(body)" >/dev/null 2>&1
+is "a second settle records a second settle event" "$(settles)" "2"
+is "but still exactly two report files" "$(rep_all "$AID")" "2"
+TW report "$AID" --note "round two" --body "x" >/dev/null 2>&1
+is "and a second report does not fork the filename either" "$(rep_all "$AID")" "2"
+
+# --- a HANDOFF keeps the ORIGINAL creation date ----------------------------
+printf '%s\n' "{\"event\":\"handoff\",\"id\":\"$AID\",\"branch\":\"demo\",\"primary_repo\":\"none\",\"mode\":\"code\",\"dispatch_pane\":\"wDISPATCH:p1\",\"ts\":\"$LATER_TS\"}" \
+  >> "$SANDBOX/.dispatch/ledger.jsonl"
+seq_state "$AID" working 262
+TW done "$AID" --force --note "after handoff" --body-file "$(body)" >/dev/null 2>&1
+TW report "$AID" --note "after handoff" --body "x" >/dev/null 2>&1
+is "a handed-off task keeps its original date (no $D1 file)" "$(rep_all "$AID")" "2"
+if [ -f "$(rep_exec "$AID" "$D0")" ] && [ ! -f "$(rep_exec "$AID" "$D1")" ]; then
+  ok "the handoff's own date is NOT used"
+else bad "the handoff's own date is NOT used" "$(ls "$SANDBOX/reports")"; fi
+
+# --- legacy un-prefixed files are tolerated, not orphaned or duplicated -----
+setup; dated_ledger; seq_state "$AID" working 263
+mkdir -p "$SANDBOX/reports"; printf 'old\n' > "$SANDBOX/reports/$AID.md"
+TW report "$AID" --note n --body "fresh" >/dev/null 2>&1
+is "an un-prefixed legacy report is rewritten in place, not twinned" "$(rep_all "$AID")" "1"
+case "$(cat "$SANDBOX/reports/$AID.md")" in *fresh*) ok "and it is the new content" ;;
+  *) bad "and it is the new content" "$(cat "$SANDBOX/reports/$AID.md")" ;; esac
+TW done "$AID" --note n --body-file "$(body)" >/dev/null 2>&1
+if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then
+  ok "and the task's other half stays on the same (legacy) prefix"
+else bad "and the task's other half stays on the same (legacy) prefix" "$(ls "$SANDBOX/reports")"; fi
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
 # TASK_SELFTEST_SECTIONS narrows a run to named sections while debugging one;
 # unset (the default, and the gate) is every section.
-SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 24 0}"
+SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 24 0}"
 
 # ---------------------------------------------------------------------------
 # the runner

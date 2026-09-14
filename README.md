@@ -104,7 +104,7 @@ It ends only when **you** say so — either by telling the session "write it up"
 or by telling Dispatch to run `bin/task-worktree wrapup <id>`. Both land in the
 same place: the session delivers a plan (decided / rejected / open questions /
 next tasks) through the ordinary `done` path, it is persisted to
-`reports/<id>.md`, and the task auto-closes.
+`reports/<YYYY-MM-DD>-<id>.md`, and the task auto-closes.
 
 ## How a task reports back
 
@@ -116,7 +116,11 @@ bin/task-worktree done --note "<summary>" [--pr <url>] [--body-file report.md]
 ```
 
 which appends a durable `settled` event to the ledger, notifies you on the
-desktop, and wakes Dispatch. `create` writes a `task.env` into the task workspace
+desktop, and wakes Dispatch. The report itself lands in `reports/`, named
+`YYYY-MM-DD-<id>.md` / `YYYY-MM-DD-<id>.executor.md` — dated with the task's
+**creation** date, so the directory reads chronologically, a task's two files
+sit together, and later settles rewrite the same file instead of scattering
+new names across the days they happened on. `create` writes a `task.env` into the task workspace
 so the executor knows its own id and which pane to wake — no guessing.
 
 A detached `bin/task-worktree watch <id>` runs as a **backstop** for the case

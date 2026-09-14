@@ -88,7 +88,7 @@ bin/task-worktree create \
   is DONE — not at spawn time.** The settle wake fired by the watcher carries the
   compare link (`Show the human this GitHub compare link: <url>`); when that wake
   arrives, display the link to the human alongside the report. `report` also
-  records the compare link in `reports/<id>.md` for durability, and executors
+  records the compare link in `reports/<YYYY-MM-DD>-<id>.md` for durability, and executors
   include it in their final report. Do not paste the compare link at spawn time.
 
 ### Autopilot: "autopilot / babysit this PR"
@@ -184,9 +184,9 @@ you think it has enough material. An interrupted dialogue loses the questions
 that were never asked. `wrapup` fires **only** on an explicit human command.
 
 Either way the session delivers its plan through the ordinary `done` path (one
-wake), you persist it with `report --body-file reports/<id>.executor.md`, and the
+wake), you persist it with `report --body-file reports/<YYYY-MM-DD>-<id>.executor.md`, and the
 task then **auto-closes** like `investigate` — the plan lives at
-`reports/<id>.md`. Its "Next tasks" section is the human's menu of what to spawn
+`reports/<YYYY-MM-DD>-<id>.md`. Its "Next tasks" section is the human's menu of what to spawn
 next: surface it, and **wait for them to pick** — do not auto-spawn from it.
 
 ## What lives where
@@ -202,9 +202,20 @@ tasks/<id>/                 ephemeral, symlink-only executor workspace
 .dispatch/autopilot.PROMPT.md       the --pr (autopilot) brief
 .dispatch/brainstorm.PROMPT.md      the brainstorm dialogue frame
 .dispatch/brainstorm.skill-*.md     per-skill guidance composed into that frame
-reports/<id>.md             the durable report/plan (survives teardown)
+reports/YYYY-MM-DD-<id>.md  the durable report/plan (survives teardown)
+reports/YYYY-MM-DD-<id>.executor.md   the executor's own words
 bin/task-worktree           this blessed script
+bin/migrate-report-filenames  one-off: renames pre-dating reports into the scheme
 ```
+
+- **Reports are date-prefixed, with the task's CREATION date**, so an `ls` of
+  `reports/` reads chronologically. The date comes from the task's `created`
+  ledger record, never from the moment the file is written: a task can settle
+  several times (and be handed off) across more than one day, and creation-dating
+  keeps a task's two files adjacent, lists it once at the point it started, and
+  makes a second settle rewrite the same file instead of forking a new name.
+  **Never construct the path by hand** — the settle wake and the `reported`
+  ledger event both carry the exact relative path; use that.
 
 - **herdr is authoritative** for worktree/agent liveness. The ledger records the
   *intent* herdr doesn't store (the human request, branch, status history).
@@ -232,7 +243,7 @@ bin/task-worktree           this blessed script
   1. **PRIMARY — the executor tells you.** Its contract makes
      `bin/task-worktree done` its final action after committing/pushing. That
      records a durable `settled` ledger event (with its note, PR/compare link and
-     full report at `reports/<id>.executor.md`), fires a desktop notification,
+     full report at `reports/<YYYY-MM-DD>-<id>.executor.md`), fires a desktop notification,
      and wakes you with a `[task-executor]` prompt.
   2. **BACKSTOP — the watcher.** `create` arms a detached, **re-arming**
      `bin/task-worktree watch <id>` process for the case where the executor dies
@@ -270,13 +281,14 @@ bin/task-worktree           this blessed script
   0. If `list` shows **`paused-by-human`**, that task is not finished — you
      stopped it. Don't report it; mention it and let it resume (or steer it).
   1. Read the executor's report. If it self-reported, the wake already carries
-     the summary and `reports/<id>.executor.md` holds the full text — no terminal
-     read needed. Otherwise `herdr agent read <id>` **before the agent workspace
+     the summary and `reports/<YYYY-MM-DD>-<id>.executor.md` holds the full text
+     (the wake names the exact path) — no terminal read needed. Otherwise `herdr agent read <id>` **before the agent workspace
      can be torn down** (once closed you can't read it again).
   2. **Persist it with `bin/task-worktree report <id>`** — always via this command,
-     and prefer `--body-file reports/<id>.executor.md` when the executor
-     self-reported (its own words are already durable there),
-     never by hand. It writes `reports/<id>.md` **first**, then a `reported` ledger
+     and prefer `--body-file` with the executor report path from the wake when
+     the executor self-reported (its own words are already durable there),
+     never by hand. It writes `reports/<YYYY-MM-DD>-<id>.md` **first** (same
+     date prefix as the executor report), then a `reported` ledger
      event, so the report is durable before any teardown:
      ```
      bin/task-worktree report <id> --status awaiting-review \
@@ -287,7 +299,7 @@ bin/task-worktree           this blessed script
 - **What `report` does with the task depends on its mode:**
   - `investigate` — `report` **auto-closes it** (teardown + branch delete) right
     after persisting. Nothing left to clean up manually.
-  - `brainstorm` — same auto-close as `investigate`: the plan at `reports/<id>.md`
+  - `brainstorm` — same auto-close as `investigate`: the plan at `reports/<YYYY-MM-DD>-<id>.md`
     *is* the deliverable, and the worktree/branch are thrown away.
   - `code` — `report` leaves the task **open** at `awaiting-review` with the
     worktree in place for the human to review in Cursor; close it later on

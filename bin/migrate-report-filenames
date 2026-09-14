@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""One-off migration: reports/<id>.md -> reports/<YYYY-MM-DD>-<id>.md
+
+Renames the durable task reports written before the dated-filename scheme so an
+`ls` of reports/ sorts chronologically. Both of a task's files (<id>.md and
+<id>.executor.md) get the SAME date, because the date comes from the task, not
+from the file:
+
+  1. the local date of the task's FIRST 'created' record in .dispatch/ledger.jsonl
+  2. failing that, the local date of its first ledger record of any kind
+  3. failing that (no ledger record at all), the file's own mtime
+
+Only files that look like task reports are touched: the stem must end in a task
+nonce (-<3 hex>), which is what `task-worktree create` appends. Hand-written
+docs such as reports/installer-spike-runbook.md are left alone and listed as
+skipped. Nothing is ever overwritten: an existing destination aborts the run.
+
+Safe to re-run — already-dated files are skipped.
+
+Usage: bin/migrate-report-filenames [--dry-run] [--root <dispatch-root>]
+"""
+import argparse
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+
+DATED = re.compile(r"^\d{4}-\d{2}-\d{2}-")
+TASK_ID = re.compile(r"^.+-[0-9a-f]{3}$")
+
+
+def local_date(ts):
+    t = (ts or "").strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.fromisoformat(t)
+    except Exception:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone().strftime("%Y-%m-%d")
+
+
+def ledger_dates(path):
+    """id -> local date, preferring the first 'created' record."""
+    created, first = {}, {}
+    try:
+        fh = open(path)
+    except OSError:
+        return {}, {}
+    with fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            i = o.get("id")
+            if not i:
+                continue
+            first.setdefault(i, o.get("ts"))
+            if o.get("event") == "created":
+                created.setdefault(i, o.get("ts"))
+    return created, first
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--root", default=os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    args = ap.parse_args()
+
+    reports = os.path.join(args.root, "reports")
+    if not os.path.isdir(reports):
+        sys.exit("no reports dir at %s" % reports)
+    created, first = ledger_dates(os.path.join(args.root, ".dispatch", "ledger.jsonl"))
+
+    before = sorted(f for f in os.listdir(reports) if f.endswith(".md"))
+    plan, skipped = [], []
+    for name in before:
+        if DATED.match(name):
+            skipped.append((name, "already dated"))
+            continue
+        stem = name[: -len(".executor.md")] if name.endswith(".executor.md") else name[: -len(".md")]
+        if not TASK_ID.match(stem):
+            skipped.append((name, "not a task report (no task nonce) — left alone"))
+            continue
+        date = local_date(created.get(stem)) or local_date(first.get(stem))
+        source = "ledger"
+        if not date:
+            date = datetime.fromtimestamp(os.path.getmtime(os.path.join(reports, name))).strftime("%Y-%m-%d")
+            source = "mtime"
+        plan.append((name, "%s-%s" % (date, name), source))
+
+    for name, dest, source in plan:
+        if os.path.exists(os.path.join(reports, dest)):
+            sys.exit("REFUSING: destination already exists: reports/%s" % dest)
+
+    for name, dest, source in plan:
+        print("%s %-46s -> %-57s (%s)" % ("would rename" if args.dry_run else "renamed     ", name, dest, source))
+        if not args.dry_run:
+            os.rename(os.path.join(reports, name), os.path.join(reports, dest))
+    for name, why in skipped:
+        print("skipped      %-46s    (%s)" % (name, why))
+
+    if args.dry_run:
+        print("\ndry run: %d would be renamed, %d skipped" % (len(plan), len(skipped)))
+        return
+
+    # --- verification: nothing lost, nothing left un-prefixed -----------------
+    after = sorted(f for f in os.listdir(reports) if f.endswith(".md"))
+    expected = sorted([d for _, d, _ in plan] + [n for n, _ in skipped])
+    if after != expected:
+        sys.exit("VERIFY FAILED: reports/ is not what the migration expected\n  extra:   %s\n  missing: %s"
+                 % (sorted(set(after) - set(expected)), sorted(set(expected) - set(after))))
+    if len(after) != len(before):
+        sys.exit("VERIFY FAILED: %d files before, %d after — something was overwritten" % (len(before), len(after)))
+    leftovers = [f for f in after if not DATED.match(f)
+                 and TASK_ID.match(f[: -len(".executor.md")] if f.endswith(".executor.md") else f[: -len(".md")])]
+    if leftovers:
+        sys.exit("VERIFY FAILED: un-prefixed task reports remain: %s" % leftovers)
+    print("\nverified: %d files before, %d after, 0 un-prefixed task reports left" % (len(before), len(after)))
+
+
+if __name__ == "__main__":
+    main()

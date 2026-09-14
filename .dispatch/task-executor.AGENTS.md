@@ -51,7 +51,9 @@ primary completion path, and it is a hard requirement of this contract:
    1. commit and push your branch (and open a PR only if the brief asked for one);
    2. run `task-worktree done --note "..."` (see above) with your final report —
       include the **PR URL** via `--pr` when you opened one, and your full
-      markdown report via `--body-file` so it survives teardown;
+      markdown report via `--body-file` so it survives teardown (it is stored
+      as `reports/<YYYY-MM-DD>-<task-id>.executor.md`, dated with your task's
+      creation date — `done` prints and records the exact path);
    3. then stop (go idle) with the same summary in your terminal.
    **Always include a GitHub compare link** for your branch against its base
    (`$TASK_COMPARE_URL` in `task.env`, or

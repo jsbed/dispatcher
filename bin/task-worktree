@@ -131,6 +131,93 @@ now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 # ledger_append <json-object-string>
 ledger_append() { printf '%s\n' "$1" >> "$LEDGER"; }
 
+# _report_path <id> <kind>   kind: report | executor
+#   -> prints the durable report path RELATIVE to $ROOT, e.g.
+#      reports/2025-09-14-fix-login-a3f.md
+#      reports/2025-09-14-fix-login-a3f.executor.md
+#
+# The ONE place that knows what a durable report file is called. Every write
+# site, every ledger entry and every wake message goes through it, so the path
+# Dispatch is told about is always the path on disk.
+#
+# WHICH DATE: the task's CREATION date — the FIRST 'created' record for the id
+# in the ledger — never "now". A task can settle several times across more than
+# one day, and a handoff swaps the executor without starting a new task; a
+# write-time date would file the executor report and the final report on
+# different days, splitting one task's two halves apart in a listing, and a
+# second settle would spawn a second differently-named file. The creation date
+# keeps both files adjacent and lists a task exactly once, at the point it
+# started. A handed-off task therefore keeps its ORIGINAL date (which is why
+# this looks for the first 'created' and not _find_created_rec's latest
+# created-or-handoff record).
+#
+# Ledger timestamps are UTC (see now()); the prefix is rendered in LOCAL time,
+# because the whole point of it is that an `ls` lines up with the human's own
+# sense of which day something happened.
+#
+# LEGACY TOLERANCE: if no dated file exists but an un-prefixed reports/<id>.md
+# does, that path is returned instead, so a report written before this scheme
+# (or one the migration missed) is still found and updated in place rather than
+# orphaned or silently duplicated.
+_report_path() {
+  python3 - "$LEDGER" "$REPORTS_DIR" "$ROOT" "$1" "$2" <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+
+ledger, reports, root, id_, kind = sys.argv[1:6]
+suffix = ".executor.md" if kind == "executor" else ".md"
+
+def local_date(ts):
+    """UTC ledger stamp -> local YYYY-MM-DD, or None if it isn't a timestamp."""
+    t = (ts or "").strip()
+    if t.endswith("Z"):
+        t = t[:-1] + "+00:00"
+    try:
+        d = datetime.fromisoformat(t)
+    except Exception:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    return d.astimezone().strftime("%Y-%m-%d")
+
+created = first = None
+try:
+    with open(ledger) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                o = json.loads(line)
+            except Exception:
+                continue
+            if o.get("id") != id_:
+                continue
+            if first is None:
+                first = o.get("ts")
+            if o.get("event") == "created" and created is None:
+                created = o.get("ts")
+except OSError:
+    pass
+
+date = local_date(created) or local_date(first) or datetime.now().strftime("%Y-%m-%d")
+
+def dated(sfx):  return "%s-%s%s" % (date, id_, sfx)
+def legacy(sfx): return "%s%s" % (id_, sfx)
+
+def here(name): return os.path.exists(os.path.join(reports, name))
+
+# Both of a task's files must share one prefix, so the choice is made from ALL
+# of the task's files, not just this one: only when NO dated file exists and a
+# legacy one does do we stay on the legacy name.
+all_sfx = (".md", ".executor.md")
+name = dated(suffix)
+if not any(here(dated(s)) for s in all_sfx) and any(here(legacy(s)) for s in all_sfx):
+    name = legacy(suffix)
+print(os.path.relpath(os.path.join(reports, name), root))
+PY
+}
+
 # _default_branch <repo> -> prints the repo's default branch (main/master)
 _default_branch() {
   local repo="$1" ref c
@@ -773,14 +860,15 @@ cmd_notify_settle() {
 
   # 1. The executor's own words, persisted BEFORE any wake so they survive even
   #    if every wake fails and the agent workspace is later torn down.
-  local exec_report=""
+  local exec_report="" exec_rel=""
   if [ -n "$body_file" ]; then
     [ -f "$body_file" ] || die "notify-settle: --body-file not found: $body_file"
     body="$(cat "$body_file")"
   fi
   if [ -n "$body" ]; then
     mkdir -p "$REPORTS_DIR"
-    exec_report="$REPORTS_DIR/$id.executor.md"
+    exec_rel="$(_report_path "$id" executor)"
+    exec_report="$ROOT/$exec_rel"
     {
       printf '%s\n\n' "# Executor report: $id (settle #$epoch, by $by)"
       [ -n "$note" ]    && printf '%s\n' "- **note:** $note"
@@ -796,7 +884,7 @@ cmd_notify_settle() {
   #    `list` accurate with no live polling.
   local entry
   entry="$(python3 - "$id" "$status" "$by" "$epoch" "$note" "$pr" "$commit" \
-                    "${exec_report:+reports/$id.executor.md}" "$compare" "$(now)" "$cause" <<'PY'
+                    "$exec_rel" "$compare" "$(now)" "$cause" <<'PY'
 import json, sys
 (id_, status, by, epoch, note, pr, commit, rf, compare, ts, cause) = sys.argv[1:12]
 print(json.dumps({
@@ -832,8 +920,8 @@ PY
   [ -n "$pr" ]          && msg="$msg PR: $pr"
   [ -n "$compare" ]     && msg="$msg Show the human this GitHub compare link: $compare"
   [ -n "$commit" ]      && msg="$msg Commit: $commit"
-  [ -n "$exec_report" ] && msg="$msg Full executor report: reports/$id.executor.md"
-  msg="$msg Next: read it (herdr agent read $id) if you need more, then persist it with bin/task-worktree report $id --status awaiting-review --note \"<summary>\"${exec_report:+ --body-file reports/$id.executor.md}, and surface the result to the human."
+  [ -n "$exec_rel" ] && msg="$msg Full executor report: $exec_rel"
+  msg="$msg Next: read it (herdr agent read $id) if you need more, then persist it with bin/task-worktree report $id --status awaiting-review --note \"<summary>\"${exec_rel:+ --body-file $exec_rel}, and surface the result to the human."
 
   local attempt
   for attempt in 1 2 3 4 5; do
@@ -867,8 +955,9 @@ Usage: task-worktree done [<task-id>] --note "<one-line summary>"
   --note      One-line summary (required) — what you did.
   --pr        Pull-request URL, when the brief asked for a PR.
   --commit    Head commit SHA of your branch.
-  --body[-file]  Your full markdown report; stored at reports/<id>.executor.md
-              so it survives teardown.
+  --body[-file]  Your full markdown report; stored at
+              reports/<YYYY-MM-DD>-<id>.executor.md (the date is the task's
+              creation date) so it survives teardown.
   --blocked   You are stopping BLOCKED, not finished (status: blocked).
   --force     Report again even if this settle was already reported.
 EOF
@@ -1436,7 +1525,7 @@ Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
                            pane. Idle is its resting state, so it never wakes
                            Dispatch on a conversational turn; it ends when the
                            human says so (or via 'wrapup'), delivers a plan to
-                           reports/<id>.md, and then auto-closes.
+                           reports/<YYYY-MM-DD>-<id>.md, then auto-closes.
   --skill    REQUIRED with --mode brainstorm, and only valid there. Which skills
              the session is briefed with: 'brainstorm', 'grill' or 'both'.
              There is no default on purpose: ASK THE HUMAN which they want.
@@ -2039,8 +2128,11 @@ usage_report() {
 Usage: task-worktree report <task-id> [--status <status>] [--note <text>]
                             [--commit <sha>] [--body <text> | --body-file <path>]
 
-  Persists the executor's report DURABLY — first to reports/<id>.md, then as a
+  Persists the executor's report DURABLY — first to the file, then as a
   'reported' ledger event — BEFORE any teardown, so it can never be lost.
+  The file is reports/<YYYY-MM-DD>-<id>.md, dated with the task's CREATION
+  date so both of a task's files sort together and a second settle rewrites
+  the same file instead of making a new one.
 
   If the task was created with --mode investigate or --mode brainstorm, it then
   auto-closes itself (teardown + branch delete, nothing to review — the report
@@ -2050,7 +2142,7 @@ Usage: task-worktree report <task-id> [--status <status>] [--note <text>]
   --status   Report status (default: awaiting-review).
   --note     One-line summary recorded in the ledger.
   --commit   Commit SHA to record (code tasks).
-  --body     Full report text (markdown) for reports/<id>.md.
+  --body     Full report text (markdown) for the report file.
   --body-file  Read the full report text from a file instead of --body.
 EOF
 }
@@ -2091,7 +2183,8 @@ cmd_report() {
 
   # 1. DURABLE report file first — human-readable, survives any teardown.
   mkdir -p "$REPORTS_DIR"
-  local report_file="$REPORTS_DIR/$id.md"
+  local report_rel; report_rel="$(_report_path "$id" report)"
+  local report_file="$ROOT/$report_rel"
   {
     printf '%s\n\n' "# Task report: $id"
     printf '%s\n' "- **status:** $status"
@@ -2103,11 +2196,11 @@ cmd_report() {
     printf '%s\n\n' '---'
     printf '%s\n' "$body"
   } > "$report_file"
-  info "report persisted: ${report_file#$ROOT/}"
+  info "report persisted: $report_rel"
 
   # 2. Ledger 'reported' event pointing at the durable file.
   local entry
-  entry="$(python3 - "$id" "$status" "$note" "$commit" "$mode" "reports/$id.md" "$(now)" <<'PY'
+  entry="$(python3 - "$id" "$status" "$note" "$commit" "$mode" "$report_rel" "$(now)" <<'PY'
 import json, sys
 (id_, status, note, commit, mode, rf, ts) = sys.argv[1:8]
 print(json.dumps({
@@ -2122,7 +2215,7 @@ PY
   # 3. Investigate and brainstorm tasks auto-close: their whole deliverable is
   #    the report, which is already safely persisted above.
   if [ "$mode" = "investigate" ] || [ "$mode" = "brainstorm" ]; then
-    info "mode=$mode → auto-closing $id (the plan/report is durable at reports/$id.md)"
+    info "mode=$mode → auto-closing $id (the plan/report is durable at $report_rel)"
     _teardown_from_rec "$rec" 1 "$id"
   else
     info "mode=code → task $id left open at '$status' for review"
