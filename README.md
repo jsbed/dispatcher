@@ -23,6 +23,7 @@ executor finishes it reports back, and Dispatch surfaces the result to you.
 bin/task-worktree create     # spin a task: worktree + executor agent
 bin/task-worktree handoff    # swap in a fresh-context executor (same worktree/branch)
 bin/task-worktree wrapup     # ask a live brainstorm session for its plan (human's word only)
+bin/task-worktree autopilot  # (executors) print the autopilot brief for my own PR
 bin/task-worktree done       # (executors) "I am finished" — wakes Dispatch
 bin/task-worktree report     # persist a report; auto-close if investigate/brainstorm
 bin/task-worktree list       # task status from the ledger
@@ -66,6 +67,14 @@ an existing **open** PR: the worktree is that PR's head branch (resolved with
 `.dispatch/autopilot.PROMPT.md` to drive conflicts → review comments → CI to
 green. `--pr` owns the branch and base (it refuses `--branch`/`--base`) and
 defaults the slug to `autopilot-pr-<N>`.
+
+You can also just **tell a live executor "run autopilot"** in its own pane. It
+runs `bin/task-worktree autopilot [<pr>]`, which prints the *same* brief from
+the same template, and drives the PR in its existing worktree — no new task, no
+new agent. It only works on **its own branch's** PR; any other PR is refused
+with a pointer to `create --pr <n>`, because driving it would mean leaving the
+lane. The verb prints text and nothing else: executors still never spawn tasks
+or call `herdr`.
 
 ### Brainstorm a design, or get grilled on one
 

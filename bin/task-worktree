@@ -9,6 +9,7 @@
 #
 # Subcommands:
 #   create    Create worktree(s) + ephemeral task dir + spawn an executor agent.
+#   autopilot (EXECUTORS) Print the autopilot brief for THIS task's own PR.
 #   handoff   Swap in a fresh-context executor on an existing worktree/branch.
 #   wrapup    Ask a LIVE brainstorm session to produce its plan now (ends it).
 #   done      Executor self-notification: "I am finished" (PRIMARY completion path).
@@ -1186,23 +1187,33 @@ Compare link for your branch: $compare"
 # ---------------------------------------------------------------------------
 PR_NUMBER=""; PR_URL=""; PR_BRANCH=""      # set by _resolve_pr
 
-# _resolve_pr <repo> <number-or-url> -> sets PR_NUMBER / PR_URL / PR_BRANCH
+# _resolve_pr <repo> <number-or-url> [<ctx>] [<allow-ref>]
+#   -> sets PR_NUMBER / PR_URL / PR_BRANCH
+#
+# <ctx> is only the error-message prefix, so the SAME resolution (and the same
+# refusals) can be reused by verbs other than `create`. <allow-ref> lets an
+# internal caller hand gh a branch name instead of a number — `autopilot` uses
+# it to find "the PR for my own branch" without the human repeating the number.
 _resolve_pr() {
-  local repo="$1" want="$2" slug out rc=0 state
+  local repo="$1" want="$2" ctx="${3:-create}" allow_ref="${4:-0}"
+  local slug out rc=0 state
   case "$want" in
     *://*) want="${want##*/}" ;;              # .../pull/123 -> 123
     '#'*)  want="${want#\#}" ;;
   esac
-  case "$want" in
-    ''|*[!0-9]*) die "create: --pr wants a PR number or url (got '$2')" ;;
-  esac
+  if [ "$allow_ref" -ne 1 ]; then
+    case "$want" in
+      ''|*[!0-9]*) die "$ctx: --pr wants a PR number or url (got '$2')" ;;
+    esac
+  fi
+  [ -n "$want" ] || die "$ctx: no PR to resolve"
 
   slug="$(_github_slug "$repo")"
-  [ -n "$slug" ] || die "create: --pr needs repo '$repo' to have a GitHub origin remote"
+  [ -n "$slug" ] || die "$ctx: --pr needs repo '$repo' to have a GitHub origin remote"
 
   out="$(gh pr view "$want" --repo "$slug" \
           --json number,state,headRefName,url,isCrossRepository 2>&1)" || rc=$?
-  [ "$rc" -eq 0 ] || die "create: gh could not read PR #$want in $slug: $out"
+  [ "$rc" -eq 0 ] || die "$ctx: gh could not read PR '$want' in $slug: $out"
 
   state="$(python3 - "$out" <<'PY'
 import json, sys
@@ -1211,7 +1222,7 @@ print("\t".join([str(d.get("number", "")), (d.get("state") or "").upper(),
                  d.get("headRefName") or "", d.get("url") or "",
                  "fork" if d.get("isCrossRepository") else ""]))
 PY
-)" || die "create: could not parse gh output for PR #$want"
+)" || die "$ctx: could not parse gh output for PR '$want'"
 
   PR_NUMBER="$(printf '%s' "$state" | cut -f1)"
   local st fork
@@ -1220,9 +1231,9 @@ PY
   PR_URL="$(printf '%s' "$state" | cut -f4)"
   fork="$(printf '%s' "$state" | cut -f5)"
 
-  [ "$st" = "OPEN" ] || die "create: PR #$PR_NUMBER in $slug is $st, not open — nothing to autopilot"
-  [ -n "$PR_BRANCH" ] || die "create: PR #$PR_NUMBER has no head branch (gh returned: $out)"
-  [ -z "$fork" ] || die "create: PR #$PR_NUMBER comes from a fork; its head branch is not on $slug's origin"
+  [ "$st" = "OPEN" ] || die "$ctx: PR #$PR_NUMBER in $slug is $st, not open — nothing to autopilot"
+  [ -n "$PR_BRANCH" ] || die "$ctx: PR #$PR_NUMBER has no head branch (gh returned: $out)"
+  [ -z "$fork" ] || die "$ctx: PR #$PR_NUMBER comes from a fork; its head branch is not on $slug's origin"
   [ -n "$PR_URL" ] || PR_URL="https://github.com/$slug/pull/$PR_NUMBER"
 }
 
@@ -1283,10 +1294,12 @@ or both?', then re-run create with their answer." ;;
   esac
 }
 
-# _autopilot_prompt <repo> <pr-number> <pr-url> <branch> -> the rendered brief
+# _autopilot_prompt <repo> <pr-number> <pr-url> <branch> [<ctx>]
+#   -> the rendered brief (the ONE definition of the autopilot loop)
 _autopilot_prompt() {
+  local ctx="${5:-create}"
   [ -f "$AUTOPILOT_PROMPT" ] \
-    || die "create: --pr needs the autopilot prompt template at $AUTOPILOT_PROMPT (or pass --prompt)"
+    || die "$ctx: the autopilot loop needs its prompt template at $AUTOPILOT_PROMPT"
   python3 - "$AUTOPILOT_PROMPT" "$1" "$2" "$3" "$4" <<'PY'
 import sys
 path, repo, num, url, branch = sys.argv[1:6]
@@ -1296,6 +1309,104 @@ for k, v in (("REPO", repo), ("PR_NUMBER", num), ("PR_URL", url), ("BRANCH", bra
     text = text.replace("{{%s}}" % k, v)
 sys.stdout.write(text)
 PY
+}
+
+# ---------------------------------------------------------------------------
+# autopilot — an EXECUTOR asks for the autopilot brief for its OWN PR.
+#
+# WHY THIS EXISTS. Autopilot used to be reachable only as a Dispatch-level mode
+# (`create --pr`), so an executor told "run autopilot" by the human, in its own
+# pane, had to refuse: it cannot spawn tasks and it must never touch herdr. But
+# the refusal was about PLUMBING, never about capability — an executor already
+# sits on the PR's branch with a worktree and gh. This verb sanctions the loop
+# in-lane while keeping the plumbing prohibition intact: it spawns nothing,
+# starts no agent, and speaks to no herdr. It only PRINTS the brief.
+#
+# ONE DEFINITION. The brief is rendered from the same .dispatch/autopilot.PROMPT.md
+# through the same _autopilot_prompt as `create --pr`, so a Dispatch-briefed
+# autopilot and a directly-asked one cannot drift apart. Its hard limits (never
+# merge, never enable auto-merge, never mark ready, never force-push someone
+# else's branch, stay on this branch, report via `done --pr`) come along with it.
+#
+# LANE ISOLATION. An executor may only autopilot the PR whose HEAD BRANCH IS ITS
+# OWN. Any other PR lives on a branch this worktree is not on, so driving it
+# would mean leaving the lane (executor rules 1 and 2) — and that is exactly the
+# case `create --pr` exists for. So the branch check below is a refusal, with
+# the command the human should ask Dispatch for instead.
+# ---------------------------------------------------------------------------
+usage_autopilot() {
+  cat >&2 <<EOF
+Usage: task-worktree autopilot [<pr-number|url>] [--repo <repo>] [--task <id>]
+
+  Called BY THE EXECUTOR when it is asked — by Dispatch or directly by the
+  human in its own pane — to run the autopilot loop on a PR. Prints the
+  rendered autopilot brief for that PR to stdout; follow it.
+
+  It is NOT a licence to spawn tasks or to touch herdr: it creates nothing,
+  starts no agent and sends no message. You run the loop yourself, in your own
+  worktree, and report with 'task-worktree done --pr <url>' as usual.
+
+  Only YOUR OWN branch's PR can be autopiloted. A PR on any other branch is
+  refused: ask the human to have Dispatch run 'create --repo <repo> --pr <n>'.
+
+  <pr>     PR number or url. Optional: defaults to this task's TASK_PR_NUMBER
+           (set by 'create --pr'), else to the open PR for this task's branch.
+  --repo   Which repo the PR lives in (default: the task's primary repo).
+  --task   Task id (default: \$TASK_ID, or TASK_ID in ./task.env).
+EOF
+}
+
+cmd_autopilot() {
+  local id="" repo="" want="" allow_ref=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --repo)    repo="$2"; shift 2 ;;
+      --task)    id="$2"; shift 2 ;;
+      --pr)      want="$2"; shift 2 ;;
+      -h|--help) usage_autopilot; return 0 ;;
+      -*) die "autopilot: unknown arg '$1'" ;;
+      *) [ -n "$want" ] && die "autopilot: unexpected arg '$1'"; want="$1"; shift ;;
+    esac
+  done
+
+  # Who are we? Same resolution as `done`: explicit > \$TASK_ID > ./task.env.
+  [ -n "$id" ] || id="${TASK_ID:-}"
+  if [ -z "$id" ] && [ -f "./task.env" ]; then
+    id="$(. ./task.env >/dev/null 2>&1; printf '%s' "${TASK_ID:-}")"
+  fi
+  [ -n "$id" ] || { usage_autopilot; die "autopilot: task id required — run it from your task dir (no \$TASK_ID and no ./task.env)"; }
+  [ -n "$(_find_created_rec "$id")" ] || die "autopilot: no ledger record for task '$id'"
+
+  local branch primary
+  branch="$(_task_field "$id" branch)"
+  primary="$(_task_field "$id" primary_repo)"
+  [ -n "$branch" ] || die "autopilot: task '$id' has no branch on record"
+  [ -n "$repo" ] || repo="$primary"
+  [ -n "$repo" ] || die "autopilot: could not work out which repo to use — pass --repo"
+
+  have gh || die "autopilot: needs the GitHub CLI ('gh') on PATH"
+  _resolve_repo "$repo"
+
+  if [ -z "$want" ]; then
+    want="$(_task_field "$id" pr_number)"
+    # No PR on record (an ordinary code task that grew a PR later): ask gh for
+    # the PR of THIS branch. Still the same lane, just a different lookup key.
+    if [ -z "$want" ]; then want="$branch"; allow_ref=1; fi
+  fi
+
+  _resolve_pr "$repo" "$want" autopilot "$allow_ref"
+
+  if [ "$PR_BRANCH" != "$branch" ]; then
+    die "autopilot: PR #$PR_NUMBER is on branch '$PR_BRANCH', but task '$id' owns '$branch'.
+An executor may only autopilot the PR for ITS OWN branch — its worktree is on
+'$branch', so driving another PR would mean leaving its lane. Tell the human to
+ask Dispatch for a dedicated autopilot task instead:
+  task-worktree create --repo $repo --pr $PR_NUMBER --request \"autopilot this PR\""
+  fi
+
+  info "autopilot brief: PR #$PR_NUMBER ($PR_URL) on $repo branch $branch"
+  info "this prints a brief and nothing else — do NOT spawn tasks or call herdr"
+  _autopilot_prompt "$repo" "$PR_NUMBER" "$PR_URL" "$branch" autopilot
 }
 
 usage_create() {
@@ -2219,10 +2330,12 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|handoff|wrapup|done|report|classify|reconcile|remove|prune|list|help> [args]
+Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|reconcile|remove|prune|list|help> [args]
 
   create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
             --mode code | investigate | brainstorm (brainstorm needs --skill).
+  autopilot (EXECUTORS) Print the autopilot brief for THIS task's own PR, for
+            an executor asked to babysit it in-lane. Spawns nothing.
   handoff   Baton-pass a task to a FRESH-context executor (same worktree/branch).
   wrapup    Ask a live --mode brainstorm session for its plan NOW (human's word only).
   done      (EXECUTORS) "I am finished" — record + notify + wake Dispatch.
@@ -2243,6 +2356,7 @@ main() {
   local cmd="${1:-help}"; shift || true
   case "$cmd" in
     create) cmd_create "$@" ;;
+    autopilot) cmd_autopilot "$@" ;;
     handoff) cmd_handoff "$@" ;;
     wrapup) cmd_wrapup "$@" ;;
     done)   cmd_done "$@" ;;

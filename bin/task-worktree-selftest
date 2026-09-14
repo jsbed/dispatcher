@@ -54,6 +54,8 @@ for arg in "$@"; do
       printf '             the suite CATCHES it (proves the dwells are not vacuous)\n'
       printf '  --falsify-witness  as --falsify but leaves the debounce hold in\n'
       printf '             place — a SLOWER false settle, i.e. the harder case\n'
+      printf '\n  TASK_SELFTEST_SECTIONS="26 21"  run only those sections (debugging;\n'
+      printf '             a full run is still the gate — the default is every section)\n'
       exit 0 ;;
     *) printf 'unknown arg: %s\n' "$arg" >&2; exit 2 ;;
   esac
@@ -516,10 +518,14 @@ mk_repo() {
   for b in "$@"; do GIT_Q "$dir" update-ref "refs/remotes/origin/$b" HEAD; done
 }
 
-# pr_fixture <number> <state> <headRefName>
+# pr_fixture <number> <state> <headRefName> [<lookup-key>]
+#
+# The stub keys fixtures by the SELECTOR gh was given, which is normally the PR
+# number — but `gh pr view <branch>` is equally real (that is how `autopilot`
+# finds the PR for a task's own branch), so the key is overridable.
 pr_fixture() {
   printf '{"number":%s,"state":"%s","headRefName":"%s","url":"https://github.com/acme/widget/pull/%s","isCrossRepository":false,"title":"t"}\n' \
-    "$1" "$2" "$3" "$1" > "$GH_STUB_STATE/$1.json"
+    "$1" "$2" "$3" "$1" > "$GH_STUB_STATE/${4:-$1}.json"
 }
 
 printf '\n\033[1mtask-worktree selftest\033[0m  (%s)\n' "$SRC"
@@ -1246,10 +1252,107 @@ out="$(TW create --repo widget --pr 7 --mode brainstorm --skill both --no-agent 
 is "--pr with --mode brainstorm is refused" "$rc" "1"
 }
 
+# ===========================================================================
+sect_26() {
+section "26. autopilot: an executor may babysit ITS OWN PR, in-lane"
+# The episode this exists for: an executor was told "run autopilot" by the human
+# in its own pane and had to refuse, because autopilot only existed as a
+# Dispatch-level mode. The verb sanctions the loop WITHOUT giving the executor
+# any of the plumbing it must never have (no spawn, no herdr), and renders the
+# brief from the SAME template as `create --pr` so the two cannot drift.
+
+# ---- happy path: the PR is on this task's own branch ----------------------
+setup; pr_sandbox; mk_repo widget feature-x; pr_fixture 7 OPEN feature-x
+id="$(TW create --repo widget --pr 7 --no-agent 2>/dev/null)"
+: > "$HERDR_STUB_LOG"                 # forget create's calls; the verb must add none
+ledger_before="$(grep -c '"event"' "$SANDBOX/.dispatch/ledger.jsonl" | tr -d ' ')"
+brief="$(TW autopilot 7 --task "$id" 2>"$SANDBOX/ap.err")"; rc=$?
+is "autopilot renders a brief for an open PR on this branch" "$rc" "0"
+for want in 'feature-x' 'https://github.com/acme/widget/pull/7' 'gh pr checks' 'Never'; do
+  case "$brief" in *"$want"*) ok "the brief is substituted with: $want" ;;
+    *) bad "the brief is substituted with: $want" "$brief" ;; esac
+done
+# It is a PRINTER, not a spawner: no worktree, no agent, no wake, nothing.
+is "autopilot touches herdr not at all" "$(grep -c . "$HERDR_STUB_LOG" | tr -d ' ')" "0"
+is "and adds no ledger event" \
+   "$(grep -c '"event"' "$SANDBOX/.dispatch/ledger.jsonl" | tr -d ' ')" "$ledger_before"
+case "$(cat "$SANDBOX/ap.err")" in *'do NOT spawn tasks or call herdr'*)
+    ok "and says so on stderr" ;;
+  *) bad "and says so on stderr" "$(cat "$SANDBOX/ap.err")" ;; esac
+
+# ---- ONE definition of the loop: identical to what create --pr briefs ------
+ledger_prompt="$(python3 - "$SANDBOX/.dispatch/ledger.jsonl" "$id" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    o = json.loads(line)
+    if o.get("id") == sys.argv[2] and o.get("event") == "created":
+        sys.stdout.write(o.get("prompt") or "")
+PY
+)"
+is "the brief is byte-identical to the one create --pr uses" \
+   "$(printf '%s' "$brief")" "$(printf '%s' "$ledger_prompt")"
+
+# ---- the PR number is optional: TASK_PR_NUMBER is on record ---------------
+brief2="$(TW autopilot --task "$id" 2>/dev/null)"
+is "with no argument it uses the task's own PR" "$brief2" "$brief"
+# and a url works as well as a number
+brief3="$(TW autopilot https://github.com/acme/widget/pull/7 --task "$id" 2>/dev/null)"
+is "a PR url resolves the same way" "$brief3" "$brief"
+
+# ---- an ordinary code task that grew a PR later: resolve by BRANCH --------
+setup; pr_sandbox; mk_repo widget feature-x
+printf '%s\n' '{"event":"created","id":"plain-1","slug":"plain","branch":"feature-x","primary_repo":"widget","mode":"code","status":"working","ts":"x"}' \
+  > "$SANDBOX/.dispatch/ledger.jsonl"
+pr_fixture 15 OPEN feature-x feature-x   # gh resolves a branch name to its PR
+out="$(TW autopilot --task plain-1 2>/dev/null)"; rc=$?
+is "a task with no PR on record resolves the PR for its branch" "$rc" "0"
+case "$out" in *'PR #15'*) ok "and the brief names the PR it found" ;;
+  *) bad "and the brief names the PR it found" "$out" ;; esac
+
+# ---- REFUSAL 1: a PR on someone else's branch is out of lane --------------
+setup; pr_sandbox; mk_repo widget feature-x other-branch
+printf '%s\n' '{"event":"created","id":"plain-1","slug":"plain","branch":"feature-x","primary_repo":"widget","mode":"code","status":"working","ts":"x"}' \
+  > "$SANDBOX/.dispatch/ledger.jsonl"
+pr_fixture 12 OPEN other-branch
+out="$(TW autopilot 12 --task plain-1 2>&1)"; rc=$?
+is "a PR on another branch is refused" "$rc" "1"
+case "$out" in *"owns 'feature-x'"*) ok "and the error names the task's own branch" ;;
+  *) bad "and the error names the task's own branch" "$out" ;; esac
+case "$out" in *'create --repo widget --pr 12'*) ok "and tells the human what to ask Dispatch for" ;;
+  *) bad "and tells the human what to ask Dispatch for" "$out" ;; esac
+
+# ---- REFUSAL 2: a PR that is not open -------------------------------------
+pr_fixture 9 CLOSED feature-x
+out="$(TW autopilot 9 --task plain-1 2>&1)"; rc=$?
+is "a closed PR is refused" "$rc" "1"
+case "$out" in *CLOSED*|*'not open'*) ok "and says the PR is not open" ;;
+  *) bad "and says the PR is not open" "$out" ;; esac
+out="$(TW autopilot 404 --task plain-1 2>&1)"; rc=$?
+is "an unknown PR fails loudly" "$rc" "1"
+
+# ---- REFUSAL 3: no task == no lane ----------------------------------------
+out="$(cd "$SANDBOX" && TASK_ID= "$SANDBOX/bin/task-worktree" autopilot 7 2>&1)"; rc=$?
+is "outside a task dir it refuses" "$rc" "1"
+case "$out" in *'task id required'*) ok "and says a task id is required" ;;
+  *) bad "and says a task id is required" "$out" ;; esac
+out="$(TW autopilot 7 --task no-such-task 2>&1)"; rc=$?
+is "an unknown task is refused" "$rc" "1"
+
+# ---- discoverability -------------------------------------------------------
+case "$(TW autopilot --help 2>&1)" in *'OWN branch'*) ok "autopilot --help states the own-branch rule" ;;
+  *) bad "autopilot --help states the own-branch rule" ;; esac
+case "$(TW autopilot --help 2>&1)" in *'NOT a licence to spawn tasks'*) ok "and that it is not a spawn licence" ;;
+  *) bad "and that it is not a spawn licence" ;; esac
+case "$(TW help 2>&1)" in *autopilot*) ok "the top-level usage lists autopilot" ;;
+  *) bad "the top-level usage lists autopilot" ;; esac
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
-SECTION_ORDER="5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 24 0"
+# TASK_SELFTEST_SECTIONS narrows a run to named sections while debugging one;
+# unset (the default, and the gate) is every section.
+SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 24 0}"
 
 # ---------------------------------------------------------------------------
 # the runner

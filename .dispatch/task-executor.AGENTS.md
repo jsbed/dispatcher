@@ -43,7 +43,10 @@ primary completion path, and it is a hard requirement of this contract:
 4. **Commit and push freely; never open PRs.** Committing to your branch and
    pushing it to the remote are the default — push when your work is ready so the
    branch is available for review. **Do not open pull requests** unless your task
-   brief explicitly asks you to.
+   brief explicitly asks you to. *Driving a PR that already exists is not
+   opening one*: if you are autopiloting (see below), pushing to that PR's
+   branch and replying to its reviews is exactly the job — you still never
+   **open**, merge or close a PR.
 5. **Finish cleanly, and say so.** Your **final action**, in this order:
    1. commit and push your branch (and open a PR only if the brief asked for one);
    2. run `task-worktree done --note "..."` (see above) with your final report —
@@ -59,6 +62,36 @@ primary completion path, and it is a hard requirement of this contract:
    than guessing or expanding scope — and report it with
    `task-worktree done --blocked --note "<what you need>"` so Dispatch hears it
    immediately instead of waiting on a watcher.
+
+## If you are asked to AUTOPILOT a PR
+
+Dispatch may brief you with the autopilot loop, **or the human may simply tell
+you "run autopilot" in your own pane**. Both are legitimate, and both mean the
+same thing: *you* drive that PR to green — conflicts → review comments → CI —
+in your own lane. Get the brief and follow it:
+
+```
+"$TASK_WORKTREE_BIN" autopilot [<pr-number|url>]      # run it from your task dir
+```
+
+It prints the loop contract (the same `.dispatch/autopilot.PROMPT.md` Dispatch
+briefs a `create --pr` task with, so the two can never drift). With no argument
+it uses your own `TASK_PR_NUMBER`, else the open PR for your branch.
+
+- **This is NOT a licence to spawn tasks or to touch herdr.** The verb creates
+  nothing and starts nothing — it only prints text. The prohibition above
+  stands in full: `task-worktree` is still the only command you may use, and
+  you never spawn another agent. Autopiloting means doing the work yourself.
+- **Only your OWN branch's PR.** The verb refuses a PR whose head branch is not
+  the branch you are on, because driving it would mean leaving your worktree
+  (rules 1 and 2). When that happens, say so and tell the human to ask Dispatch
+  for `create --repo <repo> --pr <n>` instead — a task with the right worktree.
+- **The hard limits in the brief are absolute:** never merge, never enable
+  auto-merge, never mark the PR ready, never close it, never force-push someone
+  else's branch, stay on your branch, don't open new PRs.
+- **Report as usual** when you stop: `task-worktree done --note "..." --pr <url>`
+  (with `--body-file`), or `--blocked` if the PR is waiting on a human decision
+  — a missing approval is a blocker, not something to babysit forever.
 
 ## If you are a BRAINSTORM session (`TASK_MODE=brainstorm` in `task.env`)
 

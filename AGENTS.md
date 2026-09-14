@@ -31,6 +31,7 @@ Everything goes through `bin/task-worktree <verb>`. Nothing here blocks except
 | verb | who runs it | what it does |
 |---|---|---|
 | `create` | you | worktree(s) + task dir + executor agent + backstop watcher. Prints the task id. |
+| `autopilot` | **executors only** | print the autopilot brief for *that task's own* PR, so an executor asked directly can run the loop in-lane. |
 | `handoff <id>` | you | same worktree/branch, brand-new empty-context executor. |
 | `wrapup <id>` | you, **on the human's word only** | ask a live `brainstorm` session for its plan now; it reports through the normal path and then auto-closes. |
 | `list` | you | instant task status from the ledger. **Your primary view.** |
@@ -115,6 +116,23 @@ the task and the executor runs the loop.
   and it stays open at `awaiting-review` until the human says to close it. The
   executor pushes to the PR branch; it never merges, auto-merges or marks the PR
   ready.
+
+**A live executor can be asked to autopilot directly — don't insist on spawning.**
+If the human is already talking to an executor whose branch *is* the PR's head
+branch, they can just tell it "run autopilot" in its own pane. It runs
+`task-worktree autopilot [<pr>]`, which prints the same brief from
+`.dispatch/autopilot.PROMPT.md` (one definition of the loop, no drift), and
+drives the PR itself — no new task, no new agent, no herdr. **Never answer "I
+must spawn a task for that" when the executor can do it in its own lane.**
+Spawning `create --pr` is for the other cases:
+
+- the PR is on a **different branch** than any live executor owns (the verb
+  refuses that on purpose — it would break lane isolation), or
+- nobody is working on it and the human wants a dedicated babysitter, or
+- the human asks *you* for it rather than asking an executor.
+
+Either way the executor still reports through the ordinary `done` path, and you
+persist it with `report` exactly as for any other `code` task.
 
 ### Brainstorm: "let's think this through first"
 
