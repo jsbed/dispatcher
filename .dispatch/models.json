@@ -1,0 +1,13 @@
+{
+  "tiers": {
+    "deep":     "anthropic/claude-opus-5",
+    "standard": "anthropic/claude-sonnet-5",
+    "fast":     "cursor/grok-4.6:fast"
+  },
+  "modes": {
+    "code": "standard",
+    "autopilot": "standard",
+    "investigate": "deep",
+    "brainstorm": "deep"
+  }
+}

@@ -218,6 +218,188 @@ print(os.path.relpath(os.path.join(reports, name), root))
 PY
 }
 
+# ---------------------------------------------------------------------------
+# model tiers — which MODEL an executor is spawned with
+#
+# The registry (.dispatch/models.json) has two layers on purpose:
+#   tiers  name -> model string   (change the model behind a tier ONCE and
+#                                  every mode that uses it follows)
+#   modes  mode -> tier name      (move a mode to another tier without ever
+#                                  touching a model string)
+#
+# Resolution order, highest first:
+#   --model <provider/id>          an explicit raw model, no registry involved
+#   --tier <name>                  an explicit tier
+#   $TASK_TIER_<NAME>              env re-points a tier at another model
+#   modes -> tiers                 the registry default for the task's mode
+#   nothing                        no --model is passed; pi uses its own default
+#
+# A missing or MALFORMED registry must never block spawning: it warns and falls
+# through to the agent's own default. Same for a mode mapped to a tier that does
+# not exist. An explicit --tier naming a tier that does not exist IS fatal — the
+# human asked for something specific that is not there.
+# ---------------------------------------------------------------------------
+MODELS_JSON="${TASK_MODELS_JSON:-$DISPATCH_DIR/models.json}"
+RESOLVED_MODEL=""      # set by _resolve_model (may be empty = pi's default)
+RESOLVED_TIER=""       # set by _resolve_model (empty for a raw --model)
+
+# _models_py <op> <mode> <tier-flag> <model-flag>
+#   op=resolve -> prints "<tier>\t<model>" (either may be empty), rc 2 on a
+#                 fatal unknown --tier
+#   op=show    -> prints the human-readable registry view
+_models_py() {
+  python3 - "$MODELS_JSON" "$1" "${2:-}" "${3:-}" "${4:-}" <<'PY'
+import json, os, sys
+
+path, op, mode, tier_flag, model_flag = sys.argv[1:6]
+
+def warn(msg):
+    sys.stderr.write("warning: models: %s\n" % msg)
+
+def load():
+    """The registry, or None (after warning) if it is missing/unusable."""
+    try:
+        with open(path) as fh:
+            d = json.load(fh)
+    except FileNotFoundError:
+        warn("no registry at %s - falling back to the agent's own default model" % path)
+        return None
+    except Exception as e:
+        warn("malformed registry %s (%s) - falling back to the agent's own default model"
+             % (path, e))
+        return None
+    tiers = d.get("tiers") if isinstance(d, dict) else None
+    modes = d.get("modes") if isinstance(d, dict) else None
+    if not isinstance(tiers, dict) or not isinstance(modes, dict):
+        warn("registry %s has no usable 'tiers'/'modes' - falling back to the agent's own default model" % path)
+        return None
+    return {"tiers": tiers, "modes": modes}
+
+def env_key(tier):
+    return "TASK_TIER_" + "".join(c if c.isalnum() else "_" for c in tier).upper()
+
+def env_model(tier):
+    return os.environ.get(env_key(tier)) or None
+
+def tier_model(tier, reg):
+    """Model for a tier: the env override first, then the registry."""
+    return env_model(tier) or (reg or {}).get("tiers", {}).get(tier) or None
+
+def emit(tier, model):
+    print("%s\t%s" % (tier or "", model or ""))
+
+if op == "resolve":
+    if model_flag:                       # an explicit model beats everything
+        emit("", model_flag)
+        sys.exit(0)
+    reg = load()
+    if tier_flag:                        # an explicit tier must EXIST
+        m = tier_model(tier_flag, reg)
+        if not m:
+            known = ", ".join(sorted((reg or {}).get("tiers", {}))) or "(none)"
+            sys.stderr.write(
+                "error: unknown tier '%s' (known tiers: %s; registry: %s)\n"
+                % (tier_flag, known, path))
+            sys.exit(2)
+        emit(tier_flag, m)
+        sys.exit(0)
+    if reg is None:                      # warned already; pi's own default
+        emit("", "")
+        sys.exit(0)
+    tier = reg["modes"].get(mode)
+    if not tier:
+        warn("no tier mapped for mode '%s' - falling back to the agent's own default model" % mode)
+        emit("", "")
+        sys.exit(0)
+    m = tier_model(tier, reg)
+    if not m:
+        warn("mode '%s' maps to tier '%s', which is not in the registry - falling back to the agent's own default model"
+             % (mode, tier))
+        emit("", "")
+        sys.exit(0)
+    emit(tier, m)
+    sys.exit(0)
+
+# op == show
+reg = load()
+print("registry: %s" % path)
+if reg is None:
+    print("")
+    print("(unusable - every task spawns with the agent's own default model)")
+    sys.exit(0)
+tiers, modes = reg["tiers"], reg["modes"]
+wt = max([len(t) for t in tiers] + [4])
+print("")
+print("tiers")
+for t in sorted(tiers):
+    ov = env_model(t)
+    line = "  %-*s  %s" % (wt, t, tiers[t])
+    if ov:
+        line += "   [overridden by $%s -> %s]" % (env_key(t), ov)
+    print(line)
+print("")
+print("modes (what each resolves to RIGHT NOW)")
+wm = max([len(m) for m in modes] + [4])
+for m in sorted(modes):
+    t = modes[m]
+    resolved = tier_model(t, reg) or "(unknown tier - the agent's own default)"
+    print("  %-*s -> %-*s  =>  %s" % (wm, m, wt, t, resolved))
+print("")
+print("Only --kind pi executors are given --model; other agent kinds spawn unchanged.")
+PY
+}
+
+# _resolve_model <mode-key> <tier-flag> <model-flag>
+# Sets RESOLVED_TIER / RESOLVED_MODEL (either may be empty). Fatal only on an
+# explicit --tier that does not exist.
+_resolve_model() {
+  local out rc=0
+  RESOLVED_TIER=""; RESOLVED_MODEL=""
+  out="$(_models_py resolve "$1" "${2:-}" "${3:-}")" || rc=$?
+  [ "$rc" -eq 0 ] || exit 1          # python already said what was wrong
+  RESOLVED_TIER="$(printf '%s' "$out" | cut -f1)"
+  RESOLVED_MODEL="$(printf '%s' "$out" | cut -f2)"
+}
+
+# _model_agent_args <agent-kind> [<flags-were-passed>]
+# Echoes the trailing `-- --model <m>` for `herdr agent start`, but ONLY for pi:
+# every other agent kind takes different flags, so they spawn unchanged.
+# Sets MODEL_ARGS (an array) rather than printing, so the model can contain
+# anything without quoting games.
+MODEL_ARGS=()
+_model_agent_args() {
+  local kind="$1" explicit="${2:-0}"
+  MODEL_ARGS=()
+  if [ "$kind" != "pi" ]; then
+    [ "$explicit" -eq 1 ] \
+      && info "warning: --tier/--model only applies to --kind pi (got '$kind'); spawning it unchanged"
+    RESOLVED_MODEL=""; RESOLVED_TIER=""
+    return 0
+  fi
+  [ -n "$RESOLVED_MODEL" ] && MODEL_ARGS=(-- --model "$RESOLVED_MODEL")
+  return 0
+}
+
+usage_models() {
+  cat >&2 <<EOF
+Usage: task-worktree models
+
+  Print the model registry (.dispatch/models.json): the tiers, the mode->tier
+  mapping, and what every mode resolves to RIGHT NOW (including \$TASK_TIER_*
+  env overrides). Read-only — it changes nothing.
+EOF
+}
+
+cmd_models() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -h|--help) usage_models; return 0 ;;
+      *) usage_models; die "models: unknown arg '$1'" ;;
+    esac
+  done
+  _models_py show
+}
+
 # _default_branch <repo> -> prints the repo's default branch (main/master)
 _default_branch() {
   local repo="$1" ref c
@@ -1502,7 +1684,7 @@ usage_create() {
   cat >&2 <<EOF
 Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
                             [--branch <name>] [--base <ref>] [--pr <n|url>]
-                            [--mode <mode>]
+                            [--mode <mode>] [--tier <name>] [--model <id>]
                             [--agent <kind>] [--request "<your words>"]
                             [--prompt "<opening instruction>"] [--no-agent]
 
@@ -1529,6 +1711,10 @@ Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
   --skill    REQUIRED with --mode brainstorm, and only valid there. Which skills
              the session is briefed with: 'brainstorm', 'grill' or 'both'.
              There is no default on purpose: ASK THE HUMAN which they want.
+  --tier     Model tier for the executor: any tier in .dispatch/models.json
+             (deep | standard | fast). Overrides the mode's default tier.
+  --model    Raw model id (provider/id) for the executor. Beats --tier.
+             Both only apply to --kind pi; see 'task-worktree models'.
   --agent    Executor agent kind (default: \$TASK_AGENT_KIND or 'pi').
   --request  Your original request, recorded in the ledger.
   --prompt   Opening instruction handed to the executor agent.
@@ -1539,10 +1725,13 @@ EOF
 cmd_create() {
   local slug="" branch="" base="" agent="$DEFAULT_AGENT_KIND"
   local request="" prompt="" no_agent=0 mode="code" pr="" skills=""
+  local tier="" model=""
   local -a repos=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
+      --tier)    tier="$2"; shift 2 ;;
+      --model)   model="$2"; shift 2 ;;
       --skill)   skills="$2"; shift 2 ;;
       --slug)    slug="$2"; shift 2 ;;
       --repo)    repos+=("$2"); shift 2 ;;
@@ -1573,6 +1762,19 @@ cmd_create() {
   else
     [ -z "$skills" ] || die "create: --skill only applies to --mode brainstorm (got --mode $mode)"
   fi
+
+  # Which model the executor is spawned with. Resolved BEFORE anything is
+  # created, so an unknown --tier costs nothing; a missing/malformed registry
+  # only warns and falls through to the agent's own default. An autopiloted PR
+  # resolves through the 'autopilot' mode key, not 'code'.
+  local model_key="$mode"
+  [ -n "$pr" ] && model_key="autopilot"
+  _resolve_model "$model_key" "$tier" "$model"
+  local model_explicit=0
+  { [ -n "$tier" ] || [ -n "$model" ]; } && model_explicit=1
+  _model_agent_args "$agent" "$model_explicit"
+  [ -n "$RESOLVED_MODEL" ] \
+    && info "model: $RESOLVED_MODEL${RESOLVED_TIER:+ (tier $RESOLVED_TIER)}"
 
   # --pr: resolve the PR FIRST, so nothing is created for a PR we will refuse.
   if [ -n "$pr" ]; then
@@ -1700,6 +1902,8 @@ TASK_DISPATCH_PANE="$dispatch_pane"
 TASK_COMPARE_URL="$task_compare"
 TASK_PR_NUMBER="$PR_NUMBER"
 TASK_PR_URL="$PR_URL"
+TASK_TIER="$RESOLVED_TIER"
+TASK_MODEL="$RESOLVED_MODEL"
 TASK_WORKTREE_BIN="$SELF"
 EOF
 
@@ -1713,7 +1917,8 @@ EOF
     exec_pane="$(jget "$out" "d['result']['root_pane']['pane_id']")"
     info "executor workspace: $exec_wsid  pane: $exec_pane"
 
-    herdr agent start "$id" --kind "$agent" --pane "$exec_pane" >/dev/null 2>&1 \
+    herdr agent start "$id" --kind "$agent" --pane "$exec_pane" \
+      ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} >/dev/null 2>&1 \
       || die "herdr agent start failed (kind=$agent pane=$exec_pane)"
     info "started $agent agent '$id'"
 
@@ -1763,14 +1968,16 @@ EOF
   local entry
   entry="$(python3 - "$id" "$slug" "$branch" "$primary" "$agent" \
                     "$request" "$prompt" "$exec_wsid" "$mode" "$(now)" "$wts" \
-                    "$dispatch_pane" "$task_compare" "$PR_NUMBER" "$PR_URL" "$skills" <<'PY'
+                    "$dispatch_pane" "$task_compare" "$PR_NUMBER" "$PR_URL" "$skills" \
+                    "$RESOLVED_TIER" "$RESOLVED_MODEL" <<'PY'
 import json, sys
 (id_, slug, branch, primary, agent, request, prompt, exec_ws, mode, ts, wts,
- pane, compare, pr_num, pr_url, skills) = sys.argv[1:17]
+ pane, compare, pr_num, pr_url, skills, tier, model) = sys.argv[1:19]
 print(json.dumps({
     "event": "created",
     "id": id_, "slug": slug, "branch": branch, "primary_repo": primary,
     "agent_kind": agent, "mode": mode, "skills": skills or None,
+    "tier": tier or None, "model": model or None,
     "request": request, "prompt": prompt,
     "executor_workspace_id": exec_ws or None,
     "dispatch_pane": pane or None, "compare": compare or None,
@@ -1888,6 +2095,7 @@ usage_handoff() {
   cat >&2 <<EOF
 Usage: task-worktree handoff <task-id> [--prompt "<opening instruction>"]
                             [--note-from <path>] [--agent <kind>]
+                            [--tier <name>] [--model <id>]
 
   Replaces the idle executor on an existing task with a brand-new, empty-context
   agent, keeping the SAME worktree(s), branch, uncommitted changes and PR — the
@@ -1902,13 +2110,17 @@ Usage: task-worktree handoff <task-id> [--prompt "<opening instruction>"]
                recommended — the old agent's knowledge lives in the tree/notes,
                not in the discarded context.
   --agent      Executor kind for the fresh agent (default: the task's original).
+  --tier       Model tier for the fresh agent (default: the task's recorded one).
+  --model      Raw model id for the fresh agent. Beats --tier.
 EOF
 }
 
 cmd_handoff() {
-  local id="" prompt="" note_file="" agent=""
+  local id="" prompt="" note_file="" agent="" tier="" model=""
   while [ $# -gt 0 ]; do
     case "$1" in
+      --tier)      tier="$2"; shift 2 ;;
+      --model)     model="$2"; shift 2 ;;
       --prompt)    prompt="$2"; shift 2 ;;
       --note-from) note_file="$2"; shift 2 ;;
       --agent)     agent="$2"; shift 2 ;;
@@ -1929,6 +2141,21 @@ cmd_handoff() {
   old_ws="$(jget "$rec" "d.get('executor_workspace_id') or ''")"
   agent_kind="$(jget "$rec" "d.get('agent_kind') or '$DEFAULT_AGENT_KIND'")"
   [ -n "$agent" ] && agent_kind="$agent"
+
+  # Model: the SAME one the task was spawned with, unless the caller overrides
+  # it here. Reusing the record means a handoff never silently changes the
+  # model under a task; --model/--tier are the way to change it deliberately.
+  local model_explicit=0
+  if [ -n "$model" ] || [ -n "$tier" ]; then
+    model_explicit=1
+    _resolve_model "$(jget "$rec" "d.get('mode') or 'code'")" "$tier" "$model"
+  else
+    RESOLVED_TIER="$(jget "$rec" "d.get('tier') or ''")"
+    RESOLVED_MODEL="$(jget "$rec" "d.get('model') or ''")"
+  fi
+  _model_agent_args "$agent_kind" "$model_explicit"
+  [ -n "$RESOLVED_MODEL" ] \
+    && info "model: $RESOLVED_MODEL${RESOLVED_TIER:+ (tier $RESOLVED_TIER)}"
 
   local task_dir="$TASKS_DIR/$id"
   [ -d "$task_dir" ] || die "handoff: task dir missing ($task_dir) — is the task closed?"
@@ -1959,7 +2186,8 @@ cmd_handoff() {
   new_pane="$(jget "$out" "d['result']['root_pane']['pane_id']")"
   info "new executor workspace: $new_ws  pane: $new_pane"
 
-  herdr agent start "$id" --kind "$agent_kind" --pane "$new_pane" >/dev/null 2>&1 \
+  herdr agent start "$id" --kind "$agent_kind" --pane "$new_pane" \
+    ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"} >/dev/null 2>&1 \
     || die "handoff: herdr agent start failed (kind=$agent_kind pane=$new_pane)"
   info "started fresh $agent_kind agent '$id'"
 
@@ -1985,13 +2213,19 @@ $(_done_brief "$id" "$ho_compare" "$mode")"
   _settle_release "$id" "handed off to a fresh executor"
   if [ -f "$task_dir/task.env" ]; then
     local ho_pane; ho_pane="$(_resolve_dispatch_pane "$id")"
-    python3 - "$task_dir/task.env" "$ho_pane" <<'PY' || true
+    python3 - "$task_dir/task.env" "$ho_pane" "$RESOLVED_TIER" "$RESOLVED_MODEL" <<'PY' || true
 import re, sys
-p, pane = sys.argv[1], sys.argv[2]
+p, pane, tier, model = sys.argv[1:5]
+s = open(p).read()
 if pane:
-    s = open(p).read()
     s = re.sub(r'^TASK_DISPATCH_PANE=.*$', 'TASK_DISPATCH_PANE="%s"' % pane, s, flags=re.M)
-    open(p, "w").write(s)
+for key, val in (("TASK_TIER", tier), ("TASK_MODEL", model)):
+    line = '%s="%s"' % (key, val)
+    if re.search(r'^%s=' % key, s, flags=re.M):
+        s = re.sub(r'^%s=.*$' % key, line, s, flags=re.M)
+    else:
+        s = s.rstrip("\n") + "\n" + line + "\n"
+open(p, "w").write(s)
 PY
   fi
 
@@ -1999,9 +2233,10 @@ PY
   #    prior record but records the NEW executor_workspace_id so teardown/report
   #    act on the live workspace. status stays 'working'.
   local entry
-  entry="$(python3 - "$rec" "$id" "$new_ws" "$prompt" "$note" "$(now)" <<'PY'
+  entry="$(python3 - "$rec" "$id" "$new_ws" "$prompt" "$note" "$(now)" \
+                    "$RESOLVED_TIER" "$RESOLVED_MODEL" <<'PY'
 import json, sys
-(rec, id_, new_ws, prompt, note, ts) = sys.argv[1:7]
+(rec, id_, new_ws, prompt, note, ts, tier, model) = sys.argv[1:9]
 o = json.loads(rec)
 print(json.dumps({
     "event": "handoff",
@@ -2012,6 +2247,7 @@ print(json.dumps({
     "agent_kind": o.get("agent_kind"),
     "mode": o.get("mode") or "code",
     "skills": o.get("skills"),
+    "tier": tier or None, "model": model or None,
     "request": o.get("request"),
     "prompt": prompt,
     "handoff_note": note or None,
@@ -2390,6 +2626,14 @@ for line in open(path):
 if not order:
     print("(no tasks in ledger)"); sys.exit(0)
 w = max(len(t) for t in order)
+# The model column is deliberately TINY: the tier name is the useful handle
+# (a raw --model has no tier, so its model string is shown, truncated).
+def model_tag(o):
+    t = o.get("tier")
+    if t:
+        return t[:9]
+    m = o.get("model")
+    return (m or "-")[:9]
 for tid in order:
     o = state[tid]
     repos = ",".join(w_["repo"] for w_ in o.get("worktrees", [])) or "-"
@@ -2412,7 +2656,7 @@ for tid in order:
             tail = f"(wrapping up · skills: {skills} · writing its plan) " + tail
         elif status == "working":
             tail = f"(brainstorm session · skills: {skills}) " + tail
-    print(f"{tid:<{w}}  {status:<16}  {repos:<20}  {tail[:70]}")
+    print(f"{tid:<{w}}  {status:<16}  {model_tag(o):<9}  {repos:<20}  {tail[:70]}")
 PY
 }
 
@@ -2423,10 +2667,11 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|reconcile|remove|prune|list|help> [args]
+Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|reconcile|remove|prune|list|models|help> [args]
 
   create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
             --mode code | investigate | brainstorm (brainstorm needs --skill).
+            --tier/--model pick the executor's model (see 'models').
   autopilot (EXECUTORS) Print the autopilot brief for THIS task's own PR, for
             an executor asked to babysit it in-lane. Spawns nothing.
   handoff   Baton-pass a task to a FRESH-context executor (same worktree/branch).
@@ -2440,6 +2685,7 @@ Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|recon
   remove    Close a task and clean up (keeps the branch by default).
   prune     Reconcile: drop dangling worktree symlinks + unused repo links.
   list      Show task status from the ledger.
+  models    Show the model registry: tiers, mode->tier, what each resolves to.
 
 Run 'task-worktree <cmd> --help' for details.
 EOF
@@ -2465,6 +2711,7 @@ main() {
     remove) cmd_remove "$@" ;;
     prune)  cmd_prune "$@" ;;
     list)   cmd_list "$@" ;;
+    models) cmd_models "$@" ;;
     help|-h|--help) usage ;;
     *) usage; die "unknown command '$cmd'" ;;
   esac

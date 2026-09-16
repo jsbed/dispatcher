@@ -35,6 +35,7 @@ Everything goes through `bin/task-worktree <verb>`. Nothing here blocks except
 | `handoff <id>` | you | same worktree/branch, brand-new empty-context executor. |
 | `wrapup <id>` | you, **on the human's word only** | ask a live `brainstorm` session for its plan now; it reports through the normal path and then auto-closes. |
 | `list` | you | instant task status from the ledger. **Your primary view.** |
+| `models` | you | read-only: the model registry — tiers, mode→tier, what each mode resolves to right now. |
 | `reconcile [id]` | you | repair ledger status from live herdr state (`--dry-run`, `--no-wake`). |
 | `report <id>` | you | persist the executor's report durably; auto-closes `investigate` and `brainstorm` tasks. |
 | `remove <id>` | you | teardown (`--delete-branch` optional). Explicit command only. |
@@ -58,7 +59,8 @@ bin/task-worktree create \
   --repo <repo> [--repo <other-repo> ...] \
   --request "<the human's words>" \
   --prompt "<clear opening instruction for the executor>" \
-  [--branch <name>] [--base <ref>] [--mode code|investigate|brainstorm] [--agent <kind>]
+  [--branch <name>] [--base <ref>] [--mode code|investigate|brainstorm] [--agent <kind>] \
+  [--tier deep|standard|fast] [--model <provider/id>]
 ```
 
 - The **slug** becomes `slug-<nonce>` (the task id) — reused for the branch, the
@@ -81,6 +83,18 @@ bin/task-worktree create \
   only when the human explicitly wants a different starting point (that skips the
   fetch-to-main and uses exactly what you named).
 - Default agent kind is `pi` (override with `--agent` or `$TASK_AGENT_KIND`).
+- **The model comes from the registry — don't pick one unless the human does.**
+  `.dispatch/models.json` maps **tiers** to models and **modes** to tiers
+  (`code`/`autopilot` → `standard`, `investigate`/`brainstorm` → `deep`), so a
+  plain `create` already runs on the right model. Override only on the human's
+  word: `--tier <name>` (any tier in the registry) or `--model <provider/id>`,
+  which beats `--tier`. `$TASK_TIER_<NAME>` re-points a tier for one run. A
+  missing/malformed registry only warns and lets pi use its own default; an
+  explicit `--tier` that does not exist is a hard error. Models are only handed
+  to `--kind pi` executors. Run `bin/task-worktree models` to see what resolves
+  to what right now — never hunt the file by hand. The resolved model/tier are
+  recorded, so `handoff` restarts the **same** model (override with
+  `--tier`/`--model` there) and `list` shows it.
 - The script creates worktrees via herdr, wires the symlink view, builds an
   isolated `tasks/<id>/` dir, boots the executor agent there, briefs it, and
   appends a ledger entry. It prints the task id on stdout.
@@ -198,6 +212,7 @@ tasks/<id>/                 ephemeral, symlink-only executor workspace
   <repo> -> worktree/...    the executor's isolated repo view(s)
   AGENTS.md -> executor context
 .dispatch/ledger.jsonl      append-only intent + status log (source of "why")
+.dispatch/models.json       the model registry: tiers + mode->tier mapping
 .dispatch/task-executor.AGENTS.md   the executor contract
 .dispatch/autopilot.PROMPT.md       the --pr (autopilot) brief
 .dispatch/brainstorm.PROMPT.md      the brainstorm dialogue frame

@@ -157,6 +157,11 @@ agent)
     # wakes correctly even for a multi-line brief such as the autopilot one.
     { printf 'PROMPT\t%s\t' "${1:-}"; printf '%s' "${2:-}" | tr '\n' ' '; printf '\n'; } >> "$LOG"
     echo '{"result":{}}' ;;
+  start)
+    # One log line per agent start, with the FULL argv, so the model handed to
+    # the executor (`-- --model <id>`) is assertable.
+    printf 'START\t%s\n' "$*" >> "$LOG"
+    echo '{"result":{}}' ;;
   read)   echo '{"result":{}}' ;;
   *)      echo '{"result":{}}' ;;
   esac ;;
@@ -439,6 +444,25 @@ brainstorm_sandbox() {
   export TASK_WORKTREE_STORE="$SANDBOX/wtstore"
   mkdir -p "$TASK_REPOS_DIR" "$TASK_WORKTREE_STORE"
 }
+# ---------------------------------------------------------------------------
+# model-registry fixtures
+#
+# A full sandbox (repos + PR + brainstorm templates) plus the REAL
+# .dispatch/models.json, so the tiers under test are the ones we ship.
+# ---------------------------------------------------------------------------
+models_sandbox() {
+  pr_sandbox || return 1
+  brainstorm_sandbox || return 1
+  cp "$(dirname "$SRC")/../.dispatch/models.json" "$SANDBOX/.dispatch/" 2>/dev/null \
+    || { bad "the model registry exists at .dispatch/models.json"; return 1; }
+}
+# the model the LAST `herdr agent start` was given (empty when none was passed)
+start_model() {
+  grep '^START' "$HERDR_STUB_LOG" 2>/dev/null | tail -1 \
+    | sed -n 's/.*-- --model \(.*\)$/\1/p'
+}
+starts() { grep -c '^START' "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
+
 # ---------------------------------------------------------------------------
 # live watcher lifecycle
 #
@@ -1435,12 +1459,143 @@ if [ -f "$SANDBOX/reports/$AID.executor.md" ]; then
 else bad "and the task's other half stays on the same (legacy) prefix" "$(ls "$SANDBOX/reports")"; fi
 }
 
+# ===========================================================================
+sect_28() {
+section "28. model tiers: which MODEL an executor is spawned with"
+DEEP="anthropic/claude-opus-5"
+STD="anthropic/claude-sonnet-5"
+FAST="cursor/grok-4.6:fast"
+
+# ---- every mode spawns with its tier's model ------------------------------
+setup; models_sandbox; mk_repo widget
+TW create --slug m --repo widget >/dev/null 2>&1
+is "--mode code spawns with the 'standard' tier's model" "$(start_model)" "$STD"
+
+setup; models_sandbox; mk_repo widget
+TW create --slug m --repo widget --mode investigate >/dev/null 2>&1
+is "--mode investigate spawns with the 'deep' tier's model" "$(start_model)" "$DEEP"
+
+setup; models_sandbox; mk_repo widget
+TW create --slug m --repo widget --mode brainstorm --skill grill >/dev/null 2>&1
+is "--mode brainstorm spawns with the 'deep' tier's model" "$(start_model)" "$DEEP"
+
+# an autopiloted PR resolves through the 'autopilot' key, not 'code'
+setup; models_sandbox; mk_repo widget feature-x; pr_fixture 7 OPEN feature-x
+TW create --repo widget --pr 7 >/dev/null 2>&1
+is "--pr resolves through the 'autopilot' mode key" "$(start_model)" "$STD"
+
+# ---- the override ladder --------------------------------------------------
+setup; models_sandbox; mk_repo widget
+TW create --slug m --repo widget --tier fast >/dev/null 2>&1
+is "--tier overrides the mode's default tier" "$(start_model)" "$FAST"
+
+setup; models_sandbox; mk_repo widget
+TW create --slug m --repo widget --tier fast --model "acme/custom-1" >/dev/null 2>&1
+is "--model overrides --tier" "$(start_model)" "acme/custom-1"
+
+setup; models_sandbox; mk_repo widget
+TASK_TIER_FAST="acme/env-model" TW create --slug m --repo widget --tier fast >/dev/null 2>&1
+is "\$TASK_TIER_<NAME> re-points a tier" "$(start_model)" "acme/env-model"
+
+setup; models_sandbox; mk_repo widget
+TASK_TIER_STANDARD="acme/env-standard" TW create --slug m --repo widget >/dev/null 2>&1
+is "and re-points it for a mode default too" "$(start_model)" "acme/env-standard"
+
+# ---- a broken registry NEVER blocks a spawn -------------------------------
+setup; models_sandbox; mk_repo widget; rm -f "$SANDBOX/.dispatch/models.json"
+err="$(TW create --slug m --repo widget 2>&1 >/dev/null)"; rc=$?
+is "a MISSING registry still spawns the task" "$rc" "0"
+is "and passes no --model at all" "$(start_model)" ""
+is "but the agent IS started" "$(starts)" "1"
+case "$err" in *'models:'*) ok "and warns about it on stderr" ;;
+  *) bad "and warns about it on stderr" "$err" ;; esac
+
+setup; models_sandbox; mk_repo widget; printf '{ not json' > "$SANDBOX/.dispatch/models.json"
+err="$(TW create --slug m --repo widget 2>&1 >/dev/null)"; rc=$?
+is "a MALFORMED registry still spawns the task" "$rc" "0"
+is "and passes no --model at all" "$(start_model)" ""
+case "$err" in *'models:'*) ok "and warns about it on stderr" ;;
+  *) bad "and warns about it on stderr" "$err" ;; esac
+
+# a mode pointing at a tier that does not exist is the same non-fatal story
+setup; models_sandbox; mk_repo widget
+printf '{"tiers":{"deep":"a/b"},"modes":{"code":"nope"}}' > "$SANDBOX/.dispatch/models.json"
+err="$(TW create --slug m --repo widget 2>&1 >/dev/null)"; rc=$?
+is "a mode mapped to an unknown tier still spawns" "$rc" "0"
+is "with no --model" "$(start_model)" ""
+case "$err" in *'models:'*) ok "and warns about it" ;; *) bad "and warns about it" "$err" ;; esac
+
+# ---- but an explicit unknown --tier is FATAL ------------------------------
+setup; models_sandbox; mk_repo widget
+out="$(TW create --slug m --repo widget --tier bogus 2>&1)"; rc=$?
+is "an explicit unknown --tier is a hard error" "$rc" "1"
+case "$out" in *"unknown tier 'bogus'"*) ok "and the error names the tier" ;;
+  *) bad "and the error names the tier" "$out" ;; esac
+is "and nothing is created for it" "$(grep -c '^WORKTREE' "$HERDR_STUB_LOG" | tr -d ' ')" "0"
+is "and no agent is started" "$(starts)" "0"
+
+# ---- non-pi agent kinds spawn UNCHANGED -----------------------------------
+setup; models_sandbox; mk_repo widget
+err="$(TW create --slug m --repo widget --agent claude --tier fast 2>&1 >/dev/null)"
+is "a non-pi kind is never given --model" "$(start_model)" ""
+case "$(grep '^START' "$HERDR_STUB_LOG" | tail -1)" in *'--kind claude'*)
+    ok "but it IS started, with its own kind" ;;
+  *) bad "but it IS started, with its own kind" "$(grep '^START' "$HERDR_STUB_LOG")" ;; esac
+case "$err" in *'only applies to --kind pi'*) ok "and --tier with a non-pi kind warns on stderr" ;;
+  *) bad "and --tier with a non-pi kind warns on stderr" "$err" ;; esac
+
+# ---- persisted: task.env + ledger ----------------------------------------
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug m --repo widget --tier fast 2>/dev/null)"
+env_file="$SANDBOX/tasks/$id/task.env"
+is "task.env records the tier" "$(. "$env_file" 2>/dev/null; echo "${TASK_TIER:-}")" "fast"
+is "task.env records the model" "$(. "$env_file" 2>/dev/null; echo "${TASK_MODEL:-}")" "$FAST"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"tier": "fast"'*) ok "the ledger records the tier" ;;
+  *) bad "the ledger records the tier" "$(tail -1 "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+case "$(TW list 2>&1)" in *fast*) ok "'list' surfaces it" ;;
+  *) bad "'list' surfaces it" "$(TW list 2>&1)" ;; esac
+
+# ---- handoff reuses the recorded model, unless told otherwise -------------
+TW handoff "$id" >/dev/null 2>&1
+is "handoff restarts the SAME model" "$(start_model)" "$FAST"
+is "(and it really did start a second agent)" "$(starts)" "2"
+TW handoff "$id" --tier deep >/dev/null 2>&1
+is "handoff --tier overrides it" "$(start_model)" "$DEEP"
+TW handoff "$id" --model "acme/hand" >/dev/null 2>&1
+is "handoff --model overrides it too" "$(start_model)" "acme/hand"
+TW handoff "$id" >/dev/null 2>&1
+is "and the override is what the NEXT handoff reuses" "$(start_model)" "acme/hand"
+
+# ---- the 'models' verb: view it without hunting the file ------------------
+setup; models_sandbox
+out="$(TW models 2>&1)"; rc=$?
+is "'models' succeeds" "$rc" "0"
+for want in deep standard fast "$STD" 'code' 'autopilot' 'investigate' 'brainstorm'; do
+  case "$out" in *"$want"*) ok "'models' shows: $want" ;;
+    *) bad "'models' shows: $want" "$out" ;; esac
+done
+out="$(TASK_TIER_FAST=acme/env-model TW models 2>&1)"
+case "$out" in *'TASK_TIER_FAST'*acme/env-model*) ok "'models' shows an env override in effect" ;;
+  *) bad "'models' shows an env override in effect" "$out" ;; esac
+is "'models' writes nothing to the ledger" "$(grep -c '"event"' "$SANDBOX/.dispatch/ledger.jsonl" | tr -d ' ')" "1"
+
+# ---- discoverability ------------------------------------------------------
+case "$(TW create --help 2>&1)" in *--tier*) ok "create --help documents --tier" ;;
+  *) bad "create --help documents --tier" ;; esac
+case "$(TW create --help 2>&1)" in *--model*) ok "create --help documents --model" ;;
+  *) bad "create --help documents --model" ;; esac
+case "$(TW handoff --help 2>&1)" in *--tier*) ok "handoff --help documents --tier" ;;
+  *) bad "handoff --help documents --tier" ;; esac
+case "$(TW help 2>&1)" in *models*) ok "the top-level usage lists 'models'" ;;
+  *) bad "the top-level usage lists 'models'" ;; esac
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
 # TASK_SELFTEST_SECTIONS narrows a run to named sections while debugging one;
 # unset (the default, and the gate) is every section.
-SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 24 0}"
+SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 24 0}"
 
 # ---------------------------------------------------------------------------
 # the runner

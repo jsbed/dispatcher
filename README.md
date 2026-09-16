@@ -27,6 +27,7 @@ bin/task-worktree autopilot  # (executors) print the autopilot brief for my own 
 bin/task-worktree done       # (executors) "I am finished" — wakes Dispatch
 bin/task-worktree report     # persist a report; auto-close if investigate/brainstorm
 bin/task-worktree list       # task status from the ledger
+bin/task-worktree models     # the model registry: tiers, mode->tier, what resolves now
 bin/task-worktree reconcile  # repair ledger status from live herdr state
 bin/task-worktree classify   # why is an executor idle? (stopped by you / done / crashed)
 bin/task-worktree remove     # close a task and clean up (keeps the branch)
@@ -39,6 +40,39 @@ Three kinds of task:
 - **`--mode brainstorm`** — a live dialogue **you** drive in the session's own
   pane; it produces a plan and cleans itself up (see below).
 
+### Which model an executor runs on
+
+Models come from a small editable registry, `.dispatch/models.json`, with two
+layers on purpose: **tiers** name a model, **modes** pick a tier. Change the
+model behind a tier once and every mode follows; move a mode to another tier
+without touching a model string.
+
+```json
+{
+  "tiers": { "deep": "...", "standard": "...", "fast": "..." },
+  "modes": { "code": "standard", "autopilot": "standard",
+              "investigate": "deep", "brainstorm": "deep" }
+}
+```
+
+Resolution, highest first: `--model <provider/id>` → `--tier <name>` →
+`$TASK_TIER_<NAME>` (re-points a tier) → the registry's `modes`→`tiers` →
+nothing, in which case no `--model` is passed and pi uses its own default. A
+missing or malformed registry only **warns** and falls through — it never blocks
+a spawn — but an explicit `--tier` naming a tier that does not exist is a hard
+error. Only `--kind pi` executors are given a model; other agent kinds take
+different flags and spawn unchanged (with a warning if you passed one).
+
+```
+bin/task-worktree models                                  # view/verify, changes nothing
+bin/task-worktree create --slug x --repo core --tier fast
+bin/task-worktree create --slug x --repo core --model anthropic/claude-opus-5
+```
+
+The resolved model and tier land in `tasks/<id>/task.env` and the `created`
+ledger record, so `handoff` restarts the **same** model (override it there with
+`--tier`/`--model`) and `list` shows it.
+
 ### Handing off to a fresh context
 
 When an executor has mostly finished but its context is large or spent, hand the
@@ -47,6 +81,7 @@ baton pass:
 
 ```
 bin/task-worktree handoff <task-id> [--prompt "..."] [--note-from <path>] [--agent <kind>]
+                                    [--tier <name>] [--model <provider/id>]
 ```
 
 It closes the old executor workspace (discarding its context), starts a fresh
@@ -166,7 +201,7 @@ the fail-loud paths). It runs its sections concurrently — each has its own
 sandbox, its own stub state and its own watcher — and finishes in ~10s:
 
 ```
-bin/task-worktree-selftest             # all 89 checks (default -j6)
+bin/task-worktree-selftest             # every check (default -j6)
 bin/task-worktree-selftest -j1         # serial, for debugging; same transcript
 bin/task-worktree-selftest --falsify   # prove the timing-sensitive checks still bite
 ```
@@ -183,6 +218,6 @@ fails loudly instead of the suite quietly passing for the wrong reason.
 ## What's tracked here
 
 Only the harness tooling — `AGENTS.md` (Dispatch's contract),
-`.dispatch/task-executor.AGENTS.md` (the executor's contract), and
-`bin/task-worktree`. All the actual task state (worktrees, reports, the ledger,
+`.dispatch/task-executor.AGENTS.md` (the executor's contract),
+`.dispatch/models.json` (the model registry), and `bin/task-worktree`. All the actual task state (worktrees, reports, the ledger,
 repo symlinks) is scratch and git-ignored.
