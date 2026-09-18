@@ -16,11 +16,27 @@
 #   watch     Detached settle watcher for one task (BACKSTOP; armed by create).
 #   report    Persist an executor's report durably.
 #   classify  Say WHY an executor settled (human /stop vs finished vs crashed).
+#   context-check  Is a task's executor over its context/turn handoff budget?
 #   reconcile Repair ledger status from live herdr agent state.
+#   repair-models  Backfill tier/model onto open tasks predating the registry.
 #   remove    Tear down a task: herdr worktrees, symlinks, task dir, ledger.
 #   prune     Garbage-collect dangling worktree symlinks + unused repo symlinks.
 #   list      Show current task status derived from the ledger.
 #   help      Show usage.
+#
+# CONTEXT-BUDGET HANDOFF (cost control)
+# Session cost tracks context size, and context grows roughly linearly with
+# turn count, so total cost is roughly QUADRATIC in session length — splitting
+# one long session into N shorter ones divides the total by ~N. The backstop
+# watcher (`watch`) already polls this task's live status and already reads
+# the executor's own pi session log to classify a settle; it reuses that SAME
+# read, on the SAME cadence, to estimate context tokens/turns from the OUTSIDE
+# (`context-check`) and nudges a WORKING executor towards `done --handoff` once
+# a configurable budget is crossed (\$TASK_CONTEXT_BUDGET_TOKENS, default
+# 200000; \$TASK_CONTEXT_BUDGET_TURNS, default 150; \$TASK_CONTEXT_HANDOFF=0
+# disables it). That settle reuses the EXISTING `handoff --note-from` path —
+# no parallel completion mechanism — and is NEVER nudged for --mode brainstorm
+# (a dialogue's length is the human's call, never a budget's).
 #
 # Completion is EXACTLY-ONCE per settle. Two independent paths converge on the
 # same code (`notify-settle`), which takes a per-task settle CLAIM before it
@@ -400,6 +416,133 @@ cmd_models() {
   _models_py show
 }
 
+# ---------------------------------------------------------------------------
+# repair-models — backfill tier/model onto OPEN tasks predating the registry
+#
+# 'create' has always resolved a concrete tier+model via .dispatch/models.json
+# (falling back to the agent's own default only when the registry itself is
+# missing/malformed). A task created BEFORE that resolution existed has empty
+# TASK_TIER/TASK_MODEL on record, and until now 'handoff' reused that emptiness
+# verbatim — silently handing a fresh executor pi's global default model (the
+# most expensive one) instead of the task's mode-tier. 'handoff' itself now
+# falls through to the mode when the record is empty (see cmd_handoff); this
+# verb REPAIRS THE RECORD ITSELF for every such open task, so 'list' and any
+# other reader sees the resolved tier/model too, not just the next handoff.
+# ---------------------------------------------------------------------------
+usage_repair_models() {
+  cat >&2 <<EOF
+Usage: task-worktree repair-models [<task-id> ...] [--dry-run]
+
+  Backfills a concrete tier+model onto OPEN tasks whose latest created/handoff
+  ledger record has NEITHER (they predate the model registry). Resolves from
+  the task's mode via .dispatch/models.json — the same resolution 'create' and
+  'handoff' use (an autopiloted PR resolves through 'autopilot', not its mode)
+  — then appends a durable 'model-backfilled' ledger event and patches
+  TASK_TIER/TASK_MODEL into tasks/<id>/task.env when that dir still exists.
+
+  This only repairs the RECORD. It never touches a live agent's already-
+  running model — the fix takes effect on that task's NEXT 'handoff'.
+  Tasks that already carry a tier or a model are left untouched, and a
+  mode/registry that cannot resolve to a model is skipped, not forced.
+
+  <task-id>  Limit the repair to these tasks (default: every open task).
+  --dry-run  Report what would change; write nothing.
+EOF
+}
+
+cmd_repair_models() {
+  local dry=0
+  local -a want=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --dry-run) dry=1; shift ;;
+      -h|--help) usage_repair_models; return 0 ;;
+      -*) die "repair-models: unknown arg '$1'" ;;
+      *) want+=("$1"); shift ;;
+    esac
+  done
+
+  local open_tasks
+  open_tasks="$(python3 - "$LEDGER" <<'PY'
+import json, sys
+state, order = {}, []
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line: continue
+    try: o = json.loads(line)
+    except Exception: continue
+    tid = o.get("id")
+    if not tid: continue
+    if tid not in state: order.append(tid)
+    state.setdefault(tid, {}).update(o)
+for tid in order:
+    if state[tid].get("status") != "closed":
+        print(tid)
+PY
+)"
+
+  local tid changed=0
+  while IFS= read -r tid; do
+    [ -n "$tid" ] || continue
+    if [ "${#want[@]}" -gt 0 ]; then
+      local hit=0 w
+      for w in "${want[@]}"; do [ "$w" = "$tid" ] && hit=1; done
+      [ "$hit" -eq 1 ] || continue
+    fi
+    local rec tier model mode pr model_key
+    rec="$(_find_created_rec "$tid")"
+    [ -n "$rec" ] || continue
+    tier="$(jget "$rec" "d.get('tier') or ''")"
+    model="$(jget "$rec" "d.get('model') or ''")"
+    if [ -n "$tier" ] || [ -n "$model" ]; then
+      printf '  %-34s already has tier=%-10s model=%-24s ok\n' "$tid" "${tier:--}" "${model:--}"
+      continue
+    fi
+    mode="$(jget "$rec" "d.get('mode') or 'code'")"
+    pr="$(jget "$rec" "d.get('pr_number') or ''")"
+    model_key="$mode"
+    [ -n "$pr" ] && model_key="autopilot"
+    _resolve_model "$model_key" "" ""
+    if [ -z "$RESOLVED_MODEL" ]; then
+      printf '  %-34s mode=%-10s -> no resolvable model (registry/mode issue) skip\n' "$tid" "$mode"
+      continue
+    fi
+    printf '  %-34s mode=%-10s -> BACKFILL tier=%s model=%s\n' "$tid" "$mode" "$RESOLVED_TIER" "$RESOLVED_MODEL"
+    [ "$dry" -eq 1 ] && continue
+    changed=1
+    ledger_append "$(python3 - "$tid" "$RESOLVED_TIER" "$RESOLVED_MODEL" "$(now)" <<'PY'
+import json, sys
+id_, tier, model, ts = sys.argv[1:5]
+print(json.dumps({"event": "model-backfilled", "id": id_,
+                  "tier": tier or None, "model": model, "ts": ts}))
+PY
+)"
+    local env_file="$TASKS_DIR/$tid/task.env"
+    if [ -f "$env_file" ]; then
+      python3 - "$env_file" "$RESOLVED_TIER" "$RESOLVED_MODEL" <<'PY' || true
+import re, sys
+p, tier, model = sys.argv[1:4]
+s = open(p).read()
+for key, val in (("TASK_TIER", tier), ("TASK_MODEL", model)):
+    line = '%s="%s"' % (key, val)
+    if re.search(r'^%s=' % key, s, flags=re.M):
+        s = re.sub(r'^%s=.*$' % key, line, s, flags=re.M)
+    else:
+        s = s.rstrip("\n") + "\n" + line + "\n"
+open(p, "w").write(s)
+PY
+    fi
+  done <<< "$open_tasks"
+
+  if [ "$dry" -eq 1 ]; then
+    info "repair-models: dry run — nothing written"
+  elif [ "$changed" -eq 1 ]; then
+    info "repair-models: backfilled"
+  else
+    info "repair-models: nothing to backfill"
+  fi
+}
+
 # _default_branch <repo> -> prints the repo's default branch (main/master)
 _default_branch() {
   local repo="$1" ref c
@@ -677,6 +820,207 @@ cmd_classify() {
   _classify_settle "$id" "$sess"
 }
 
+# ---------------------------------------------------------------------------
+# context-budget handoff discipline
+#
+# EVIDENCE (see the task brief / commit message): total session cost is
+# roughly QUADRATIC in turn count, because per-turn cost tracks context size
+# and context grows ~linearly with turns (re-sent cacheRead+cacheWrite was 91%
+# of one 326-turn, $82 session). Splitting one long session into N shorter
+# ones divides the total by ~N. The fix is DISCIPLINE, not new plumbing: an
+# executor that senses its own context/turn count crossing a budget should
+# hand off to a fresh-context executor instead of running for hundreds more
+# turns.
+#
+# HOW AN EXECUTOR "KNOWS" ITS CONTEXT SIZE: it does not have to. Dispatch's
+# existing backstop watcher already polls herdr for this task's live status
+# and already reads the executor's OWN pi session log to classify a settle
+# (see _classify_session above) — that JSONL carries per-turn `usage` (input +
+# cacheRead + cacheWrite = the context actually sent on the most recent turn),
+# which is exactly the metric the cost evidence is built on. So the watcher
+# reuses the SAME session-log read, on the SAME poll cadence, to estimate
+# context size and turn count from the OUTSIDE, and nudges the executor with a
+# plain steering prompt when a budget is crossed — no in-process extension, no
+# new file format, no polling added to the executor's own loop.
+#
+# THE MECHANISM DELIBERATELY REUSES 'handoff'. The nudge asks the executor to
+# write ./HANDOFF.md and call `done --handoff`, which is a settle exactly like
+# any other (same claim, same exactly-once gate, same executor report
+# persistence) but with status 'awaiting-handoff' instead of
+# 'awaiting-dispatch'/'blocked'. notify-settle then tells Dispatch to run the
+# EXISTING `handoff --note-from <persisted executor report>` verb — no
+# parallel completion path, nothing that could race or double-fire against the
+# settle/re-arm machinery above.
+#
+# NEVER FOR BRAINSTORM. A brainstorm session's length is the HUMAN's call
+# (see the wrapup contract) — Dispatch must never decide a dialogue has run
+# long enough, budget or not. The nudge is gated on mode != brainstorm before
+# it ever inspects a budget.
+#
+# CONFIGURABLE, NOT HARDCODED: $TASK_CONTEXT_BUDGET_TOKENS (default 200000)
+# and $TASK_CONTEXT_BUDGET_TURNS (default 150), either axis trips it; either
+# set to 0 disables that axis, and $TASK_CONTEXT_HANDOFF=0 disables the whole
+# feature (the watcher's settle detection is completely unaffected either way
+# — this is a nudge on top of it, not a replacement for any part of it).
+# ---------------------------------------------------------------------------
+CONTEXT_BUDGET_TOKENS="${TASK_CONTEXT_BUDGET_TOKENS:-200000}"
+CONTEXT_BUDGET_TURNS="${TASK_CONTEXT_BUDGET_TURNS:-150}"
+
+# _context_stats <cwd> [explicit-session-file]
+#   prints "<tokens>\t<turns>\t<session-basename>" — never fails.
+#   tokens: input+cacheRead+cacheWrite of the LAST assistant turn's usage —
+#           the context actually sent on the most recent turn, i.e. the same
+#           proxy the cost-controls evidence is built on (0 if unavailable).
+#   turns:  count of assistant message entries in the session.
+_context_stats() {
+  python3 - "${1:-}" "$PI_SESSIONS_DIR" "${2:-}" <<'PY'
+import glob, json, os, sys
+
+cwd, sessions_root, explicit = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def newest(paths):
+    paths = [p for p in paths if os.path.isfile(p)]
+    return max(paths, key=os.path.getmtime) if paths else ""
+
+def session_file():
+    if explicit:
+        return explicit if os.path.isfile(explicit) else ""
+    if not cwd:
+        return ""
+    direct = os.path.join(sessions_root, "-" + cwd.replace("/", "-") + "--")
+    hit = newest(glob.glob(os.path.join(direct, "*.jsonl")))
+    if hit:
+        return hit
+    cands = sorted(glob.glob(os.path.join(sessions_root, "*", "*.jsonl")),
+                   key=os.path.getmtime, reverse=True)[:60]
+    for f in cands:
+        try:
+            with open(f) as fh:
+                head = json.loads(fh.readline())
+        except Exception:
+            continue
+        if head.get("cwd") == cwd:
+            return f
+    return ""
+
+f = session_file()
+if not f:
+    print("0\t0\t")
+    raise SystemExit(0)
+
+turns = 0
+tokens = 0
+with open(f) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        m = o.get("message") or {}
+        if m.get("role") == "assistant":
+            turns += 1
+            u = m.get("usage") or {}
+            tokens = int(u.get("input") or 0) + int(u.get("cacheRead") or 0) \
+                   + int(u.get("cacheWrite") or 0)
+
+print("%d\t%d\t%s" % (tokens, turns, os.path.basename(f)))
+PY
+}
+
+# _context_check <id> [session-file]
+#   prints "<tokens>\t<turns>\t<over 0|1>\t<reason>\t<session-basename>"
+#   Never fails: a missing/unreadable session log reports 0/0/not-over.
+_context_check() {
+  local id="$1" sess="${2:-}" cwd="" stats tokens turns basename reason="" over=0
+  if [ -z "$sess" ]; then
+    cwd="$(_agent_cwd "$id")"
+    [ -n "$cwd" ] || cwd="$TASKS_DIR/$id"
+  fi
+  stats="$(_context_stats "$cwd" "$sess")"
+  tokens="$(printf '%s' "$stats" | cut -f1)"
+  turns="$(printf '%s' "$stats" | cut -f2)"
+  basename="$(printf '%s' "$stats" | cut -f3)"
+  if [ "${CONTEXT_BUDGET_TOKENS:-0}" -gt 0 ] 2>/dev/null && [ "${tokens:-0}" -ge "$CONTEXT_BUDGET_TOKENS" ]; then
+    over=1; reason="context ~${tokens} tokens >= budget ${CONTEXT_BUDGET_TOKENS}"
+  fi
+  if [ "${CONTEXT_BUDGET_TURNS:-0}" -gt 0 ] 2>/dev/null && [ "${turns:-0}" -ge "$CONTEXT_BUDGET_TURNS" ]; then
+    [ "$over" -eq 1 ] && reason="$reason; "
+    over=1; reason="${reason}${turns} turns >= budget ${CONTEXT_BUDGET_TURNS}"
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\n' "$tokens" "$turns" "$over" "$reason" "$basename"
+}
+
+usage_context_check() {
+  cat >&2 <<EOF
+Usage: task-worktree context-check <task-id> [--session <pi-session.jsonl>]
+
+  Estimates the LIVE executor's context size from its OWN pi session log (the
+  same technique 'classify' uses) and reports whether it has crossed the
+  configured handoff budget:
+    \$TASK_CONTEXT_BUDGET_TOKENS  (default 200000; 0 disables this axis)
+    \$TASK_CONTEXT_BUDGET_TURNS   (default 150;    0 disables this axis)
+
+  Prints: <tokens>\t<turns>\t<over 0|1>\t<reason>\t<session-file-basename>
+  Exit code: 0 under budget, 1 over budget. Never fails outright: a missing or
+  unreadable session log reports 0/0/not-over rather than erroring.
+
+  Read-only and informational — it changes nothing. The backstop watcher runs
+  this same check on its own poll cadence and nudges a WORKING executor
+  towards 'done --handoff' when it trips (never for --mode brainstorm).
+EOF
+}
+
+cmd_context_check() {
+  local id="" sess=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --session) sess="$2"; shift 2 ;;
+      -h|--help) usage_context_check; return 0 ;;
+      -*) die "context-check: unknown arg '$1'" ;;
+      *) [ -n "$id" ] && die "context-check: unexpected arg '$1'"; id="$1"; shift ;;
+    esac
+  done
+  [ -n "$id" ] || { usage_context_check; die "context-check: task id required"; }
+  local out over
+  out="$(_context_check "$id" "$sess")"
+  printf '%s\n' "$out"
+  over="$(printf '%s' "$out" | cut -f3)"
+  [ "$over" = "1" ] && return 1
+  return 0
+}
+
+# _context_nudge_marker <id> -> the dedupe marker path (keyed by session
+# basename, so a fresh executor's fresh session file gets nudged again).
+_context_nudge_marker() { printf '%s/%s.ctxnudge\n' "$SETTLE_DIR" "$1"; }
+
+# _maybe_nudge_context_handoff <id> — called by the watcher on each poll while
+# the task is WORKING. Never touches the settle claim (this is a steer, not a
+# settle) and never fires for --mode brainstorm (see the block comment above).
+_maybe_nudge_context_handoff() {
+  local id="$1"
+  [ "${TASK_CONTEXT_HANDOFF:-1}" = "0" ] && return 0
+  [ "$(_task_field "$id" mode)" = "brainstorm" ] && return 0
+  local chk tokens over reason base marker seen
+  chk="$(_context_check "$id")"
+  over="$(printf '%s' "$chk" | cut -f3)"
+  reason="$(printf '%s' "$chk" | cut -f4)"
+  base="$(printf '%s' "$chk" | cut -f5)"
+  [ "$over" = "1" ] || return 0
+  [ -n "$base" ] || return 0          # no session log to key the dedupe on
+  marker="$(_context_nudge_marker "$id")"
+  seen=""; [ -f "$marker" ] && seen="$(cat "$marker" 2>/dev/null || true)"
+  [ "$seen" = "$base" ] && return 0   # already nudged for this session file
+  printf '%s' "$base" > "$marker"
+  _watch_log "context budget crossed for $id ($reason) — nudging handoff"
+  herdr agent prompt "$id" "CONTEXT-BUDGET NOTICE from Dispatch's backstop watcher: your session has reached $reason. Per the context-budget handoff discipline in your AGENTS.md: bring your CURRENT step to a safe stopping point, write ./HANDOFF.md (what is done, what is left, key files, gotchas), then take this as your FINAL action for this round instead of continuing:
+  $SELF done $id --handoff --note \"<one-line summary>\" --body-file ./HANDOFF.md
+Do NOT call plain 'done' for this — --handoff tells Dispatch to swap you for a fresh-context executor on the SAME worktree/branch, not to close the task for review." >/dev/null 2>&1 \
+    || _watch_log "warning: context-budget nudge prompt failed for $id"
+}
+
 # _discover_dispatch_pane -> pane id of the Dispatch agent (cwd == the root)
 _discover_dispatch_pane() {
   local out
@@ -929,6 +1273,7 @@ _record_conversing() {
 _settle_forget() {
   rm -f  "$SETTLE_DIR/$1.claim" 2>/dev/null || true
   rm -rf "$SETTLE_DIR/$1.lock"  2>/dev/null || true
+  rm -f  "$(_context_nudge_marker "$1")" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------------------
@@ -1103,7 +1448,16 @@ PY
   [ -n "$compare" ]     && msg="$msg Show the human this GitHub compare link: $compare"
   [ -n "$commit" ]      && msg="$msg Commit: $commit"
   [ -n "$exec_rel" ] && msg="$msg Full executor report: $exec_rel"
-  msg="$msg Next: read it (herdr agent read $id) if you need more, then persist it with bin/task-worktree report $id --status awaiting-review --note \"<summary>\"${exec_rel:+ --body-file $exec_rel}, and surface the result to the human."
+  if [ "$status" = "awaiting-handoff" ]; then
+    # CONTEXT-BUDGET HANDOFF: the executor is NOT finished — it is handing off
+    # before its context grows further. Reuse the EXISTING 'handoff' verb
+    # (--note-from the durable executor report, so the fresh executor gets the
+    # prior one's own words) instead of the ordinary 'report' path.
+    msg="$msg This is a CONTEXT-BUDGET HANDOFF request, not a finished task — do NOT run 'report' for it."
+    msg="$msg Next: swap in a fresh-context executor with: bin/task-worktree handoff $id${exec_rel:+ --note-from $exec_rel}"
+  else
+    msg="$msg Next: read it (herdr agent read $id) if you need more, then persist it with bin/task-worktree report $id --status awaiting-review --note \"<summary>\"${exec_rel:+ --body-file $exec_rel}, and surface the result to the human."
+  fi
 
   local attempt
   for attempt in 1 2 3 4 5; do
@@ -1124,7 +1478,7 @@ usage_done() {
 Usage: task-worktree done [<task-id>] --note "<one-line summary>"
                           [--pr <url>] [--commit <sha>]
                           [--body <text> | --body-file <path>]
-                          [--blocked] [--force]
+                          [--blocked] [--handoff] [--force]
 
   Called BY THE EXECUTOR as its final action, after committing and pushing.
   Records the durable settle event, notifies the human and wakes Dispatch.
@@ -1141,6 +1495,13 @@ Usage: task-worktree done [<task-id>] --note "<one-line summary>"
               reports/<YYYY-MM-DD>-<id>.executor.md (the date is the task's
               creation date) so it survives teardown.
   --blocked   You are stopping BLOCKED, not finished (status: blocked).
+  --handoff   You are NOT finished — you are handing off before your context
+              grows further (the context-budget discipline; usually asked for
+              by a nudge from Dispatch's backstop watcher). Write ./HANDOFF.md
+              FIRST and pass it via --body-file. Tells Dispatch to swap you for
+              a fresh-context executor with 'handoff --note-from', not to
+              close the task for review. Refused for --mode brainstorm (a
+              dialogue's length is the human's call, never a budget's).
   --force     Report again even if this settle was already reported.
 EOF
 }
@@ -1148,13 +1509,14 @@ EOF
 cmd_done() {
   local id="" status="awaiting-dispatch"
   local -a pass=()
-  local note_seen=0
+  local note_seen=0 handoff=0
   while [ $# -gt 0 ]; do
     case "$1" in
       --note)      note_seen=1; pass+=(--note "$2"); shift 2 ;;
       --pr|--commit|--body|--body-file|--dispatch-pane|--compare)
                    pass+=("$1" "$2"); shift 2 ;;
       --blocked)   status="blocked"; shift ;;
+      --handoff)   handoff=1; shift ;;
       --force)     pass+=(--force); shift ;;
       -h|--help)   usage_done; return 0 ;;
       -*) die "done: unknown arg '$1'" ;;
@@ -1169,7 +1531,15 @@ cmd_done() {
   fi
   [ -n "$id" ] || { usage_done; die "done: task id required (no \$TASK_ID and no ./task.env)"; }
   [ "$note_seen" -eq 1 ] || { usage_done; die "done: --note is required"; }
-  [ -n "$(_find_created_rec "$id")" ] || die "done: no ledger record for task '$id'"
+  local rec; rec="$(_find_created_rec "$id")"
+  [ -n "$rec" ] || die "done: no ledger record for task '$id'"
+
+  if [ "$handoff" -eq 1 ]; then
+    [ "$status" != "blocked" ] || die "done: --handoff and --blocked are mutually exclusive"
+    [ "$(jget "$rec" "d.get('mode') or 'code'")" != "brainstorm" ] \
+      || die "done: --handoff does not apply to --mode brainstorm — a dialogue ends on the human's word, never a context budget. End it the normal way (write up the plan, then plain 'done')."
+    status="awaiting-handoff"
+  fi
 
   cmd_notify_settle "$id" --by executor --status "$status" ${pass[@]+"${pass[@]}"}
 }
@@ -1195,6 +1565,13 @@ Usage: task-worktree watch <task-id> [--dispatch-pane <pane>] [--compare <url>]
   a dialogue, so idle is its resting state; it is recorded once as
   'in-conversation'). Agent errors, a vanished agent, and anything ambiguous
   still wake — the session DYING is not a conversational pause.
+
+  On every poll while the executor is WORKING, the watcher also runs the
+  context-budget check ('context-check') against the executor's own pi
+  session log, and nudges it once (per session file) towards 'done --handoff'
+  when \$TASK_CONTEXT_BUDGET_TOKENS/_TURNS is crossed. This is a steering
+  prompt, not a settle — it never touches the settle claim, and it is skipped
+  entirely for --mode brainstorm. Disable with \$TASK_CONTEXT_HANDOFF=0.
 EOF
 }
 
@@ -1318,7 +1695,10 @@ cmd_watch() {
       st="$(_agent_status "$id")"
       case "$st" in
         idle|done|blocked) break ;;                     # a real, held settle
-        working) gone=0 ;;                              # resumed mid-window
+        working)                                        # resumed mid-window
+          gone=0
+          _maybe_nudge_context_handoff "$id"            # never a settle; just a steer
+          ;;
         "") if [ ! -d "$TASKS_DIR/$id" ]; then
               _watch_log "agent gone + task dir gone — exiting cleanly"; return 0
             fi
@@ -2018,13 +2398,28 @@ _find_created_rec() {
 import json, sys
 path, id_ = sys.argv[1], sys.argv[2]
 found = None
+# A 'model-backfilled' event (see 'repair-models') carries no worktree/branch
+# info of its own, so it is never a candidate for 'found' itself. Instead it
+# OVERLAYS tier/model onto the current created/handoff record, transparently,
+# for every caller that reads d.get('tier')/d.get('model') through here. It is
+# reset the moment a NEWER created/handoff record appears, so a backfill can
+# never outlive the executor record it was backfilling.
+backfill = None
 for line in open(path):
     line = line.strip()
     if not line: continue
     try: o = json.loads(line)
     except Exception: continue
-    if o.get("id") == id_ and o.get("event") in ("created", "handoff"):
+    if o.get("id") != id_: continue
+    if o.get("event") in ("created", "handoff"):
         found = o
+        backfill = None
+    elif o.get("event") == "model-backfilled":
+        backfill = o
+if found is not None and backfill is not None:
+    found = dict(found)
+    found["tier"] = backfill.get("tier")
+    found["model"] = backfill.get("model")
 print(json.dumps(found) if found else "")
 PY
 }
@@ -2152,6 +2547,18 @@ cmd_handoff() {
   else
     RESOLVED_TIER="$(jget "$rec" "d.get('tier') or ''")"
     RESOLVED_MODEL="$(jget "$rec" "d.get('model') or ''")"
+    if [ -z "$RESOLVED_TIER" ] && [ -z "$RESOLVED_MODEL" ]; then
+      # This task predates the model registry (or was never resolved): fall
+      # through to the SAME mode-based resolution 'create' uses, rather than
+      # silently handing the fresh executor pi's global default model (the
+      # most expensive one). An autopiloted PR resolves through 'autopilot',
+      # exactly as 'create' does.
+      local legacy_mode_key; legacy_mode_key="$(jget "$rec" "d.get('mode') or 'code'")"
+      [ -n "$(jget "$rec" "d.get('pr_number') or ''")" ] && legacy_mode_key="autopilot"
+      _resolve_model "$legacy_mode_key" "" ""
+      [ -n "$RESOLVED_MODEL" ] \
+        && info "handoff: task '$id' had no recorded model — resolved '$legacy_mode_key' -> $RESOLVED_MODEL (tier ${RESOLVED_TIER:-none})"
+    fi
   fi
   _model_agent_args "$agent_kind" "$model_explicit"
   [ -n "$RESOLVED_MODEL" ] \
@@ -2643,6 +3050,8 @@ for tid in order:
     # never silently swallowed — it surfaces here (and in `reconcile`).
     if status == "paused-by-human":
         tail = "(stopped by you — steer it or let it resume) " + tail
+    elif status == "awaiting-handoff":
+        tail = f"(CONTEXT-BUDGET HANDOFF — run: task-worktree handoff {tid}) " + tail
     elif o.get("cause") == "agent-error" and o.get("event") == "settled":
         tail = "(settled on an AGENT/PROVIDER ERROR) " + tail
     # A brainstorm session is a DIALOGUE: idle means "waiting for you to type",
@@ -2667,7 +3076,7 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|reconcile|remove|prune|list|models|help> [args]
+Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|context-check|reconcile|repair-models|remove|prune|list|models|help> [args]
 
   create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
             --mode code | investigate | brainstorm (brainstorm needs --skill).
@@ -2677,10 +3086,14 @@ Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|recon
   handoff   Baton-pass a task to a FRESH-context executor (same worktree/branch).
   wrapup    Ask a live --mode brainstorm session for its plan NOW (human's word only).
   done      (EXECUTORS) "I am finished" — record + notify + wake Dispatch.
-  watch     Detached settle backstop for one task (armed automatically).
+            --handoff: NOT finished — a context-budget handoff request instead.
+  watch     Detached settle backstop for one task (armed automatically). Also
+            nudges a WORKING executor towards 'done --handoff' on a context budget.
   report    Persist a report durably; auto-close if --mode investigate/brainstorm.
   classify  Why did an executor settle? (human /stop vs finished vs crashed)
+  context-check  Is this task's executor over its context/turn handoff budget?
   reconcile Repair ledger status from live herdr agent state.
+  repair-models  Backfill tier/model onto open tasks that predate the registry.
 
   remove    Close a task and clean up (keeps the branch by default).
   prune     Reconcile: drop dangling worktree symlinks + unused repo links.
@@ -2707,7 +3120,9 @@ main() {
     _status)  _agent_status "$@" ;;
     report) cmd_report "$@" ;;
     classify) cmd_classify "$@" ;;
+    context-check) cmd_context_check "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
+    repair-models) cmd_repair_models "$@" ;;
     remove) cmd_remove "$@" ;;
     prune)  cmd_prune "$@" ;;
     list)   cmd_list "$@" ;;
