@@ -111,6 +111,27 @@ with a pointer to `create --pr <n>`, because driving it would mean leaving the
 lane. The verb prints text and nothing else: executors still never spawn tasks
 or call `herdr`.
 
+### Opening a PR
+
+Ask Dispatch to open a PR and it **always arms auto-merge**, because `gh pr
+create` has no flag for it:
+
+```
+gh pr create --repo <owner/repo> --base main --head <branch> --title "..." --body "..."
+gh pr merge <N> --repo <owner/repo> --auto --squash
+```
+
+Auto-merge is not a bypass: GitHub still holds the PR until its own rules pass.
+On `Femtum/core` that means **1 approving review plus `Validate All / Success
+Gate`**. You approve, and it merges itself — no coming back to click a button.
+
+Auto-merge must be enabled on the repo (`allow_auto_merge`). It is on for
+`Femtum/core`; **off** for `Femtum/vision-lib` and `jsbed/dispatcher`, where
+Dispatch will tell you rather than quietly open an unarmed PR.
+
+Executors never touch merge state — no merging, no auto-merge, no marking ready,
+autopilot included. That lives with Dispatch on purpose.
+
 ### Brainstorm a design, or get grilled on one
 
 ```

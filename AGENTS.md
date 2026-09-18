@@ -322,6 +322,49 @@ bin/migrate-report-filenames  one-off: renames pre-dating reports into the schem
     (they never open PRs unless the brief said so), so just confirm the branch is
     pushed — don't push it yourself, and don't auto-clean code tasks.
 
+## Opening a PR — always with auto-merge armed
+
+When the human asks **you** to open a PR, auto-merge is **not optional and not a
+question**. `gh pr create` has no auto-merge flag, so it is always two commands:
+
+```
+gh pr create --repo <owner/repo> --base main --head <branch> \
+  --title "<conventional-commit title>" --body "<summary>"
+gh pr merge <N> --repo <owner/repo> --auto --squash
+```
+
+**Run the second command every single time, immediately after the first.** A PR
+opened without `--auto` sits waiting on a human who has already said they want it
+in — that is the exact babysitting this harness exists to delete.
+
+- **`--squash`**, not `--merge`: `core` forbids merge commits and enforces linear
+  history. `--rebase` also satisfies it; squash is the default choice.
+- **Auto-merge is not a bypass.** It fires only once GitHub's own rules are
+  satisfied. On `Femtum/core` that is **1 approving review + the `Validate All /
+  Success Gate` check**. The human still approves; they just stop having to come
+  back and click merge.
+- **Confirm it armed.** `gh pr merge --auto` fails loudly if the repo has
+  auto-merge disabled. Check with
+  `gh api repos/<owner>/<repo> --jq .allow_auto_merge`. Current state:
+
+  | repo | `allow_auto_merge` | required to merge |
+  |---|---|---|
+  | `Femtum/core` | ✅ true | 1 approval + `Validate All / Success Gate` |
+  | `Femtum/vision-lib` | ❌ false | — must be enabled in repo settings first |
+  | `jsbed/dispatcher` | ❌ false | — must be enabled in repo settings first |
+
+  Where it is `false`, **say so and stop** — do not silently open a PR without
+  auto-merge, and do not flip the repo setting yourself without being asked.
+- **A repo with no required approvals is a trap.** If a repo ever required zero
+  reviews, `--auto` would merge the moment checks went green, unreviewed. Check
+  the ruleset before arming auto-merge on a repo not in the table above.
+- Report the PR URL **and** that auto-merge is armed, so the human knows the only
+  thing left is their approval.
+
+**Executors are unaffected.** Their contract still forbids merging, enabling
+auto-merge, or marking a PR ready — including autopilot tasks. Merge state is
+**Dispatch-side only**; that boundary is deliberate and stays.
+
 ## Cleanup — only on explicit command
 
 Only when the human says e.g. *"Dispatch, close fix-login-a3f"*:
