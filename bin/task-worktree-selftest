@@ -412,6 +412,60 @@ pi_session() {
 }
 no_pi_session() { rm -rf "$TASK_PI_SESSIONS_DIR"; }
 cause() { TW classify "$AID" | cut -f1; }
+
+# ctx_session <turns> <tokens-per-turn> [<basename>] — a session log with N
+# user/assistant pairs, each assistant message carrying <tokens-per-turn> as
+# its usage.input (cacheRead/cacheWrite 0), so _context_stats's "last
+# assistant turn" reads exactly that value and turns == N. A distinct
+# <basename> simulates a FRESH executor's fresh session file (e.g. after a
+# handoff), which is what the nudge dedupe keys on.
+ctx_session() {
+  local turns="$1" tokens="${2:-0}" name="${3:-ctxsession}" dir n
+  dir="$TASK_PI_SESSIONS_DIR/-$(printf '%s' "$HERDR_STUB_CWD" | tr '/' '-')--"
+  mkdir -p "$dir"
+  {
+    printf '{"type":"session","version":3,"id":"s","cwd":"%s","timestamp":"x"}\n' "$HERDR_STUB_CWD"
+    for n in $(seq 1 "$turns"); do
+      printf '{"type":"message","id":"u%s","parentId":null,"timestamp":"x","message":{"role":"user","content":"go","timestamp":1}}\n' "$n"
+      printf '{"type":"message","id":"a%s","parentId":"u%s","timestamp":"x","message":{"role":"assistant","content":[],"stopReason":"stop","usage":{"input":%s,"output":10,"cacheRead":0,"cacheWrite":0,"totalTokens":%s},"timestamp":2}}\n' \
+        "$n" "$n" "$tokens" "$tokens"
+    done
+  } > "$dir/$name.jsonl"
+  sleep 0.02   # keep mtimes strictly ordered across successive calls
+}
+
+# strip_task_model <id> — rewrites the id's latest created/handoff ledger
+# record to tier=null/model=null, simulating a task that predates the model
+# registry (see the postgres-provisioning-d50 case in the task brief).
+strip_task_model() {
+  local id="$1" f="$SANDBOX/.dispatch/ledger.jsonl"
+  python3 - "$f" "$id" <<'PY'
+import json, sys
+path, id_ = sys.argv[1], sys.argv[2]
+lines = [l for l in open(path).read().splitlines() if l.strip()]
+out = []
+for line in lines:
+    o = json.loads(line)
+    if o.get("id") == id_ and o.get("event") in ("created", "handoff"):
+        o["tier"] = None
+        o["model"] = None
+    out.append(json.dumps(o))
+open(path, "w").write("\n".join(out) + "\n")
+PY
+}
+# strip_env_model <id> — blanks TASK_TIER/TASK_MODEL in that task's task.env
+strip_env_model() {
+  local f="$SANDBOX/tasks/$1/task.env"
+  [ -f "$f" ] || return 0
+  python3 - "$f" <<'PY'
+import re, sys
+p = sys.argv[1]
+s = open(p).read()
+s = re.sub(r'^TASK_TIER=.*$', 'TASK_TIER=""', s, flags=re.M)
+s = re.sub(r'^TASK_MODEL=.*$', 'TASK_MODEL=""', s, flags=re.M)
+open(p, "w").write(s)
+PY
+}
 pauses() { grep -c '"event": *"paused"' "$SANDBOX/.dispatch/ledger.jsonl" 2>/dev/null | tr -d ' '; }
 
 # ---------------------------------------------------------------------------
@@ -1590,12 +1644,202 @@ case "$(TW help 2>&1)" in *models*) ok "the top-level usage lists 'models'" ;;
   *) bad "the top-level usage lists 'models'" ;; esac
 }
 
+# ===========================================================================
+sect_29() {
+section "29. legacy tasks: handoff/repair-models never fall through to the global default"
+DEEP="anthropic/claude-opus-5"
+STD="anthropic/claude-sonnet-5"
+
+# ---- handoff resolves from MODE when the record has no tier/model --------
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug legacy --repo widget 2>/dev/null)"
+strip_task_model "$id"; strip_env_model "$id"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"tier": null'*) ok "fixture: the record now has no tier" ;;
+  *) bad "fixture: the record now has no tier" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+TW handoff "$id" >/dev/null 2>&1
+is "handoff resolves the LEGACY task from its mode instead of the global default" "$(start_model)" "$STD"
+
+# an autopiloted legacy task resolves through 'autopilot', not 'code'
+setup; models_sandbox; mk_repo widget feature-y; pr_fixture 9 OPEN feature-y
+id="$(TW create --repo widget --pr 9 2>/dev/null)"
+strip_task_model "$id"; strip_env_model "$id"
+TW handoff "$id" >/dev/null 2>&1
+is "a legacy --pr task's handoff resolves through 'autopilot'" "$(start_model)" "$STD"
+
+# an explicit --tier/--model at handoff time still wins over the fallback
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug legacy2 --repo widget 2>/dev/null)"
+strip_task_model "$id"; strip_env_model "$id"
+TW handoff "$id" --tier deep >/dev/null 2>&1
+is "an explicit handoff --tier still overrides the mode fallback" "$(start_model)" "$DEEP"
+
+# ---- repair-models: the bulk backfill/repair path -------------------------
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug legacy3 --repo widget 2>/dev/null)"
+strip_task_model "$id"; strip_env_model "$id"
+
+out="$(TW repair-models --dry-run 2>&1)"
+case "$out" in *"BACKFILL tier=standard model=$STD"*) ok "--dry-run reports the backfill it WOULD make" ;;
+  *) bad "--dry-run reports the backfill it WOULD make" "$out" ;; esac
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *model-backfilled*) bad "--dry-run wrote nothing" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;;
+  *) ok "--dry-run wrote nothing" ;; esac
+
+TW repair-models >/dev/null 2>&1
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"event": "model-backfilled"'*'"model": "'$STD'"'*) ok "the ledger records a model-backfilled event" ;;
+  *) bad "the ledger records a model-backfilled event" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+is "task.env is patched with the resolved tier" "$(. "$SANDBOX/tasks/$id/task.env" 2>/dev/null; echo "${TASK_TIER:-}")" "standard"
+is "task.env is patched with the resolved model" "$(. "$SANDBOX/tasks/$id/task.env" 2>/dev/null; echo "${TASK_MODEL:-}")" "$STD"
+case "$(TW list 2>&1)" in *"$id"*standard*) ok "'list' now shows the backfilled tier" ;;
+  *) bad "'list' now shows the backfilled tier" "$(TW list 2>&1)" ;; esac
+
+# now that the record is repaired, a plain handoff reuses IT (not a second
+# mode-fallback resolution) -- proven by an explicit override still winning
+TW handoff "$id" >/dev/null 2>&1
+is "and a subsequent handoff reuses the backfilled model" "$(start_model)" "$STD"
+
+# running it again is a no-op: already has a tier now
+before="$(grep -c model-backfilled "$SANDBOX/.dispatch/ledger.jsonl")"
+TW repair-models >/dev/null 2>&1
+after="$(grep -c model-backfilled "$SANDBOX/.dispatch/ledger.jsonl")"
+is "repair-models is idempotent (no second backfill event)" "$after" "$before"
+
+# ---- tasks that already carry a tier/model are left untouched ------------
+setup; models_sandbox; mk_repo widget
+id2="$(TW create --slug fine --repo widget --tier fast 2>/dev/null)"
+out="$(TW repair-models "$id2" 2>&1)"
+case "$out" in *"$id2"*already*) ok "a task that already has a tier is reported as already-fine" ;;
+  *) bad "a task that already has a tier is reported as already-fine" "$out" ;; esac
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"event": "model-backfilled", "id": "'"$id2"'"'*) bad "and nothing is backfilled for it" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;;
+  *) ok "and nothing is backfilled for it" ;; esac
+
+# ---- scoping to specific ids ----------------------------------------------
+setup; models_sandbox; mk_repo widget
+idA="$(TW create --slug aaa --repo widget 2>/dev/null)"; strip_task_model "$idA"; strip_env_model "$idA"
+idB="$(TW create --slug bbb --repo widget 2>/dev/null)"; strip_task_model "$idB"; strip_env_model "$idB"
+TW repair-models "$idA" >/dev/null 2>&1
+is "only the NAMED task is backfilled" "$(grep -c '"event": "model-backfilled"' "$SANDBOX/.dispatch/ledger.jsonl")" "1"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"event": "model-backfilled", "id": "'"$idA"'"'*) ok "and it is the one asked for" ;;
+  *) bad "and it is the one asked for" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+
+# ---- discoverability -------------------------------------------------------
+case "$(TW help 2>&1)" in *repair-models*) ok "the top-level usage lists 'repair-models'" ;;
+  *) bad "the top-level usage lists 'repair-models'" ;; esac
+case "$(TW repair-models --help 2>&1)" in *--dry-run*) ok "repair-models --help documents --dry-run" ;;
+  *) bad "repair-models --help documents --dry-run" ;; esac
+}
+
+# ===========================================================================
+sect_30() {
+section "30. context-budget handoff discipline"
+# ctx_body <path> — a tiny local report file, so --body-file has a real file
+# to persist (this section's own helper: 'body()' in section 26/27 is scoped
+# to that section's subshell only).
+ctx_body() { printf '# body\n' > "$SANDBOX/body.md"; printf '%s' "$SANDBOX/body.md"; }
+
+# ---- context-check: the raw budget estimate -------------------------------
+# context-check resolves the executor's cwd via 'herdr agent get', which the
+# stub only answers once a state file exists — hence seq_state first.
+setup; seq_state "$AID" working 899
+ctx_session 5 50000
+out="$(TW context-check "$AID" 2>&1)"; rc=$?
+is "under the default budgets, context-check exits 0" "$rc" "0"
+case "$out" in 50000$'\t'5$'\t'0*) ok "and reports tokens/turns/over correctly" ;;
+  *) bad "and reports tokens/turns/over correctly" "$out" ;; esac
+
+out="$(TASK_CONTEXT_BUDGET_TOKENS=40000 TW context-check "$AID" 2>&1)"; rc=$?
+is "a lowered token budget trips it" "$rc" "1"
+case "$out" in *'context ~50000 tokens >= budget 40000'*) ok "and says why" ;;
+  *) bad "and says why" "$out" ;; esac
+
+out="$(TASK_CONTEXT_BUDGET_TURNS=3 TW context-check "$AID" 2>&1)"; rc=$?
+is "a lowered turn budget trips it too" "$rc" "1"
+case "$out" in *'5 turns >= budget 3'*) ok "and says why" ;;
+  *) bad "and says why" "$out" ;; esac
+
+out="$(TASK_CONTEXT_BUDGET_TOKENS=0 TASK_CONTEXT_BUDGET_TURNS=0 TW context-check "$AID" 2>&1)"; rc=$?
+is "0 disables BOTH axes" "$rc" "0"
+
+no_pi_session
+out="$(TW context-check "$AID" 2>&1)"; rc=$?
+is "no session log at all is never over budget" "$rc" "0"
+case "$out" in 0$'\t'0$'\t'0*) ok "and reports 0/0" ;; *) bad "and reports 0/0" "$out" ;; esac
+
+# ---- done --handoff: a settle, but NOT a finish ---------------------------
+setup; seq_state "$AID" working 900
+TW done "$AID" --handoff --note "context budget" --body-file "$(ctx_body)" >/dev/null 2>&1
+is "done --handoff records exactly one settle" "$(settles)" "1"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"status": "awaiting-handoff"'*) ok "recorded with status awaiting-handoff" ;;
+  *) bad "recorded with status awaiting-handoff" "$(ledger | tail -1)" ;; esac
+wake="$(grep '^PROMPT.wDISPATCH:p1' "$HERDR_STUB_LOG" | tail -1)"
+case "$wake" in *'handoff '"$AID"*--note-from*) ok "the wake tells Dispatch to run 'handoff --note-from'" ;;
+  *) bad "the wake tells Dispatch to run 'handoff --note-from'" "$wake" ;; esac
+case "$wake" in *'report '*) bad "and it does NOT say 'report'" "$wake" ;; *) ok "and it does NOT say 'report'" ;; esac
+
+rc=0; TW done "$AID" --handoff --blocked --note x --force >/dev/null 2>&1 || rc=$?
+is "--handoff and --blocked are mutually exclusive" "$rc" "1"
+
+setup; brainstorm_ledger; seq_state "$AID" working 901
+rc=0; err="$(TW done "$AID" --handoff --note x 2>&1)" || rc=$?
+is "--handoff is REFUSED for --mode brainstorm" "$rc" "1"
+case "$err" in *brainstorm*) ok "and says why" ;; *) bad "and says why" "$err" ;; esac
+is "and nothing was settled" "$(settles)" "0"
+
+# ---- the watcher nudges a WORKING executor over budget --------------------
+setup; seq_state "$AID" working 910
+ctx_session 5 999999 sessA
+start_watcher
+wait_watcher_armed
+wait_until '[ "$(agent_prompts)" -ge 1 ]'
+case "$(cat "$SANDBOX/.dispatch/logs/watch-$AID.log")" in *'nudging handoff'*) ok "the watcher logs the nudge" ;;
+  *) bad "the watcher logs the nudge" "$(cat "$SANDBOX/.dispatch/logs/watch-$AID.log")" ;; esac
+prompt="$(grep "^PROMPT.$AID" "$HERDR_STUB_LOG" | tail -1)"
+case "$prompt" in *'--handoff'*'HANDOFF.md'*) ok "and the prompt tells the executor to write HANDOFF.md and call done --handoff" ;;
+  *) bad "and the prompt tells the executor to write HANDOFF.md and call done --handoff" "$prompt" ;; esac
+first_n="$(agent_prompts)"
+dwell
+is "it does not nag again for the SAME session file" "$(agent_prompts)" "$first_n"
+
+# a FRESH executor's fresh session file (different basename) gets nudged again
+ctx_session 5 999999 sessB
+wait_until "[ \"\$(agent_prompts)\" -ge $((first_n + 1)) ]"
+ok "a new session file (post-handoff) is nudged again"
+stop_watchers
+
+# ---- never for brainstorm ---------------------------------------------------
+setup; brainstorm_ledger; seq_state "$AID" working 920
+ctx_session 5 999999
+start_watcher
+wait_watcher_armed
+dwell
+is "a brainstorm session over budget is NEVER nudged" "$(agent_prompts)" "0"
+stop_watchers
+
+# ---- \$TASK_CONTEXT_HANDOFF=0 disables the whole feature -------------------
+setup; seq_state "$AID" working 930
+ctx_session 5 999999
+export TASK_CONTEXT_HANDOFF=0
+start_watcher
+wait_watcher_armed
+dwell
+is "TASK_CONTEXT_HANDOFF=0 suppresses the nudge entirely" "$(agent_prompts)" "0"
+stop_watchers
+unset TASK_CONTEXT_HANDOFF
+
+# ---- discoverability -------------------------------------------------------
+case "$(TW help 2>&1)" in *context-check*) ok "the top-level usage lists 'context-check'" ;;
+  *) bad "the top-level usage lists 'context-check'" ;; esac
+case "$(TW done --help 2>&1)" in *--handoff*) ok "done --help documents --handoff" ;;
+  *) bad "done --help documents --handoff" ;; esac
+case "$(TW watch --help 2>&1)" in *context-budget*) ok "watch --help documents the context-budget nudge" ;;
+  *) bad "watch --help documents the context-budget nudge" ;; esac
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
 # TASK_SELFTEST_SECTIONS narrows a run to named sections while debugging one;
 # unset (the default, and the gate) is every section.
-SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 24 0}"
+SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 30 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 29 24 0}"
 
 # ---------------------------------------------------------------------------
 # the runner
