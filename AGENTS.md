@@ -41,8 +41,10 @@ Everything goes through `bin/task-worktree <verb>`. Nothing here blocks except
 | `remove <id>` | you | teardown (`--delete-branch` optional). Explicit command only. |
 | `prune` | you | drop dangling symlinks. |
 | `classify <id>` | you (debug) | *why* an agent is idle: `human-interrupt` / `completed` / `agent-error` / `unknown`. |
-| `done` | **executors only** | "I'm finished/blocked" — the primary wake path. |
-| `watch <id>` | detached, automatic | backstop watcher; armed by `create`. |
+| `context-check <id>` | you (debug) | is that task's executor over its context/turn handoff budget right now? |
+| `repair-models [id...]` | you | backfill tier/model onto open tasks that predate the model registry (`--dry-run`). |
+| `done` | **executors only** | "I'm finished/blocked/handing-off" — the primary wake path. |
+| `watch <id>` | detached, automatic | backstop watcher; armed by `create`. Also nudges a working executor towards `done --handoff` on a context budget. |
 | `notify-settle` | internal | the one place a settle is recorded + announced. |
 
 Any verb takes `--help`. `bin/task-worktree-selftest` exercises the whole
@@ -94,7 +96,12 @@ bin/task-worktree create \
   to `--kind pi` executors. Run `bin/task-worktree models` to see what resolves
   to what right now — never hunt the file by hand. The resolved model/tier are
   recorded, so `handoff` restarts the **same** model (override with
-  `--tier`/`--model` there) and `list` shows it.
+  `--tier`/`--model` there) and `list` shows it. A task created **before** this
+  registry existed has no recorded tier/model; `handoff` on one of those falls
+  through to resolving the task's **mode** (never pi's expensive global
+  default), and `bin/task-worktree repair-models [--dry-run]` backfills the
+  ledger record itself for every such open task in one pass — run it once if
+  `list`'s model column shows `-` for an old task.
 - The script creates worktrees via herdr, wires the symlink view, builds an
   isolated `tasks/<id>/` dir, boots the executor agent there, briefs it, and
   appends a ledger entry. It prints the task id on stdout.
@@ -321,6 +328,28 @@ bin/migrate-report-filenames  one-off: renames pre-dating reports into the schem
     explicit command. Executors **commit and push their own branch by default**
     (they never open PRs unless the brief said so), so just confirm the branch is
     pushed — don't push it yourself, and don't auto-clean code tasks.
+- **A settle can also be a CONTEXT-BUDGET HANDOFF request, not a finished
+  task.** Long sessions cost roughly quadratically more (context grows with
+  turns, and cost tracks context), so an executor's contract asks it to hand
+  off before its context/turn count runs away instead of grinding through
+  hundreds more turns. `bin/task-worktree watch` already polls this task and
+  already reads its pi session log to classify settles; it reuses that same
+  read to estimate context size from the outside and nudges a **working**
+  executor towards `done --handoff` once a budget is crossed
+  (`$TASK_CONTEXT_BUDGET_TOKENS`, default 200000; `$TASK_CONTEXT_BUDGET_TURNS`,
+  default 150; either axis trips it, either set to `0` disables it,
+  `$TASK_CONTEXT_HANDOFF=0` disables the whole feature). This is **never**
+  nudged for `--mode brainstorm` — a dialogue's length is the human's call.
+  - The resulting settle status is `awaiting-handoff`, and the wake message
+    says so explicitly. **Do not run `report` for it** — the task is not
+    finished. Instead reuse the existing verb exactly as the wake message says:
+    ```
+    bin/task-worktree handoff <id> --note-from <path from the wake>
+    ```
+    (that path is the durable executor report the settle just persisted — the
+    fresh executor gets the departing one's own HANDOFF.md words). The task
+    stays `working` afterwards, same as any other handoff; no `report`, no
+    teardown, nothing else to do.
 
 ## Cleanup — only on explicit command
 

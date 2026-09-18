@@ -13,6 +13,7 @@ primary completion path, and it is a hard requirement of this contract:
 ```
 "$TASK_WORKTREE_BIN" done --note "<one-line summary>" \
     [--pr <url>] [--commit <sha>] [--body-file <path-to-your-report.md>]
+    [--blocked | --handoff]
 ```
 
 - Run it **from your task dir** (it reads `./task.env`), or pass your task id
@@ -64,6 +65,51 @@ primary completion path, and it is a hard requirement of this contract:
    than guessing or expanding scope — and report it with
    `task-worktree done --blocked --note "<what you need>"` so Dispatch hears it
    immediately instead of waiting on a watcher.
+
+## Context-budget handoff discipline
+
+Long sessions cost roughly *quadratically* more as they grow: cost per turn
+tracks context size, and context grows with turn count, so a single 300+ turn
+session costs far more than the same work split across several shorter ones.
+**Hand off before that happens rather than after.**
+
+You do not need to track your own context size — you have no reliable way to
+see it from inside the conversation anyway. **Dispatch's backstop watcher does
+it for you**: it already polls this task and already reads your own pi session
+log to detect when you settle, and it reuses that exact same read to estimate
+your context/turn count from the outside, on the same poll cadence. When you
+cross the configured budget (default ~200k tokens or ~150 turns, whichever
+comes first — see `$TASK_CONTEXT_BUDGET_TOKENS`/`$TASK_CONTEXT_BUDGET_TURNS` if
+you want the exact numbers in effect), it sends you a plain steering message
+starting with `CONTEXT-BUDGET NOTICE`.
+
+**When you receive that message:**
+
+1. Bring your CURRENT step to a safe stopping point — do not abandon
+   mid-edit or leave the tree broken. Commit/push what is already solid, same
+   as any other pause.
+2. Write `./HANDOFF.md` in your task dir: what is done, what is left, key
+   files, gotchas, anything the next executor would otherwise have to
+   rediscover the hard way. This is the ONLY thing that survives — write it
+   like the next executor has none of your context, because it will not.
+3. Take this as your FINAL action for this round, instead of continuing:
+   ```
+   "$TASK_WORKTREE_BIN" done --handoff --note "<one-line summary>" \
+       --body-file ./HANDOFF.md
+   ```
+   **Do NOT call plain `done` for this** — `--handoff` tells Dispatch you are
+   NOT finished, just handing off before your context grows further. Dispatch
+   swaps you for a fresh-context executor on the SAME worktree/branch via
+   `task-worktree handoff --note-from`; it does not close the task or review
+   your work as final.
+
+You may also self-initiate this (write `./HANDOFF.md` and call
+`done --handoff`) if you notice you are deep into a very long session, even
+without a notice — the notice is a safety net, not a permission gate.
+
+**This never applies to a BRAINSTORM session** (see below): a dialogue's
+length is the human's call, never a budget's, and the watcher never sends you
+this notice in that mode.
 
 ## If you are asked to AUTOPILOT a PR
 
