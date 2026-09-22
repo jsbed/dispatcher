@@ -35,7 +35,8 @@ bin/task-worktree prune      # reconcile dangling symlinks
 ```
 
 Three kinds of task:
-- **`--mode code`** — changes files; stays open for review, closed later.
+- **`--mode code`** — changes files; stays open for review, closed later. Add
+  `--scoped` when the work is already specified (see the model registry below).
 - **`--mode investigate`** — read-only "find me X"; reports and cleans itself up.
 - **`--mode brainstorm`** — a live dialogue **you** drive in the session's own
   pane; it produces a plan and cleans itself up (see below).
@@ -50,13 +51,25 @@ without touching a model string.
 ```json
 {
   "tiers": { "deep": "...", "standard": "...", "fast": "..." },
-  "modes": { "code": "standard", "autopilot": "standard",
+  "modes": { "code": "deep", "code-scoped": "standard",
+              "autopilot": "standard",
               "investigate": "deep", "brainstorm": "deep" }
 }
 ```
 
+**Code work has two keys, because the axis that predicts cost is how
+open-ended the work is** — not whether it touches the tree. A plain code task
+is assumed open-ended (investigation, diagnosis, bug hunting) and gets `deep`.
+Passing `create --scoped` is an explicit assertion that the work is a small,
+well-specified change or the straight execution of an implementation plan, and
+resolves through `code-scoped` → `standard`. Scopedness is **never inferred**
+from a slug, a prompt or a diff size: no `--scoped`, no discount. It is
+code-only — a hard error with `--mode investigate`, `--mode brainstorm` and with
+`--pr` (autopilot keeps its own `standard` tier).
+
 Resolution, highest first: `--model <provider/id>` → `--tier <name>` →
-`$TASK_TIER_<NAME>` (re-points a tier) → the registry's `modes`→`tiers` →
+`$TASK_TIER_<NAME>` (re-points a tier) → `--scoped` (code → `code-scoped`) → the
+registry's `modes`→`tiers` →
 nothing, in which case no `--model` is passed and pi uses its own default. A
 missing or malformed registry only **warns** and falls through — it never blocks
 a spawn — but an explicit `--tier` naming a tier that does not exist is a hard
@@ -65,13 +78,17 @@ different flags and spawn unchanged (with a warning if you passed one).
 
 ```
 bin/task-worktree models                                  # view/verify, changes nothing
+bin/task-worktree create --slug x --repo core              # open-ended code -> deep
+bin/task-worktree create --slug x --repo core --scoped     # asserted small/planned -> standard
 bin/task-worktree create --slug x --repo core --tier fast
 bin/task-worktree create --slug x --repo core --model anthropic/claude-opus-5
 ```
 
 The resolved model and tier land in `tasks/<id>/task.env` and the `created`
-ledger record, so `handoff` restarts the **same** model (override it there with
-`--tier`/`--model`) and `list` shows it.
+ledger record — along with the scopedness itself — so `handoff` restarts the
+**same** model (a `--scoped` task hands off to `standard`, an open-ended one to
+`deep`; override it there with `--tier`/`--model`), and `list` shows the tier
+plus `scoped`/`open-ended` so you can see *why* a task got the model it did.
 
 ### Handing off to a fresh context
 

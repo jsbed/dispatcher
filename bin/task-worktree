@@ -243,10 +243,22 @@ PY
 #   modes  mode -> tier name      (move a mode to another tier without ever
 #                                  touching a model string)
 #
+# Code work has TWO mode keys, not one, because the axis that predicts cost is
+# not "does this touch the tree" but "is this open-ended":
+#   code         open-ended code work — investigation, diagnosis, bug hunting.
+#                DEEP by default: the expensive-but-correct model.
+#   code-scoped  'create --scoped': the human ASSERTED this is a small,
+#                well-specified change, or the straight execution of an
+#                implementation plan. STANDARD.
+# 'code-scoped' is only ever reached through an explicit --scoped. Scopedness is
+# NEVER inferred from a slug, a prompt's length, or any other heuristic: the
+# cheap path costs correctness when it is wrong, so it must be asserted.
+#
 # Resolution order, highest first:
 #   --model <provider/id>          an explicit raw model, no registry involved
 #   --tier <name>                  an explicit tier
 #   $TASK_TIER_<NAME>              env re-points a tier at another model
+#   --scoped                       code -> the 'code-scoped' mode key
 #   modes -> tiers                 the registry default for the task's mode
 #   nothing                        no --model is passed; pi uses its own default
 #
@@ -323,6 +335,14 @@ if op == "resolve":
         emit("", "")
         sys.exit(0)
     tier = reg["modes"].get(mode)
+    if not tier and mode.endswith("-scoped"):
+        # An older registry has no 'code-scoped' key. Fall back to the base
+        # mode rather than to pi's global default: the task still resolves,
+        # just without the cheaper scoped tier.
+        base = mode[: -len("-scoped")]
+        tier = reg["modes"].get(base)
+        if tier:
+            warn("registry has no '%s' key - falling back to '%s' -> %s" % (mode, base, tier))
     if not tier:
         warn("no tier mapped for mode '%s' - falling back to the agent's own default model" % mode)
         emit("", "")
@@ -355,11 +375,26 @@ for t in sorted(tiers):
     print(line)
 print("")
 print("modes (what each resolves to RIGHT NOW)")
+NOTE = {
+    "code":        "create --mode code           (open-ended: investigation/diagnosis/bug hunting)",
+    "code-scoped": "create --mode code --scoped  (asserted small/well-specified, or executing a plan)",
+    "autopilot":   "create --pr <n>              (driving an existing PR to green)",
+    "investigate": "create --mode investigate",
+    "brainstorm":  "create --mode brainstorm",
+}
 wm = max([len(m) for m in modes] + [4])
 for m in sorted(modes):
     t = modes[m]
     resolved = tier_model(t, reg) or "(unknown tier - the agent's own default)"
     print("  %-*s -> %-*s  =>  %s" % (wm, m, wt, t, resolved))
+    note = NOTE.get(m)
+    if note:
+        print("  %-*s    %-*s      %s" % (wm, "", wt, "", note))
+print("")
+print("The code tier depends on how OPEN-ENDED the work is, not on the mode alone:")
+print("a plain 'create' code task is deep, and only an explicit --scoped buys the")
+print("cheaper 'code-scoped' tier. Scopedness is never inferred - no --scoped, no")
+print("discount. --scoped is rejected for investigate/brainstorm and for --pr.")
 print("")
 print("Only --kind pi executors are given --model; other agent kinds spawn unchanged.")
 PY
@@ -375,6 +410,22 @@ _resolve_model() {
   [ "$rc" -eq 0 ] || exit 1          # python already said what was wrong
   RESOLVED_TIER="$(printf '%s' "$out" | cut -f1)"
   RESOLVED_MODEL="$(printf '%s' "$out" | cut -f2)"
+}
+
+# _model_mode_key <mode> <pr-ish> <scoped 0|1>
+# The registry key a task resolves through. ONE definition, so 'create',
+# 'handoff' and 'repair-models' can never drift:
+#   an autopiloted PR -> 'autopilot'  (never 'code')
+#   code + --scoped   -> 'code-scoped'
+#   anything else     -> the mode itself
+# A task with no recorded scopedness (created before --scoped existed, or
+# simply created without it) resolves as plain 'code' — deep. That is the safe
+# direction: the cheap tier is only ever reached by an explicit assertion.
+_model_mode_key() {
+  local mode="${1:-code}" pr="${2:-}" scoped="${3:-0}"
+  if [ -n "$pr" ] && [ "$pr" != "None" ]; then printf 'autopilot'; return 0; fi
+  if [ "$mode" = "code" ] && [ "$scoped" = "1" ]; then printf 'code-scoped'; return 0; fi
+  printf '%s' "$mode"
 }
 
 # _model_agent_args <agent-kind> [<flags-were-passed>]
@@ -402,7 +453,8 @@ Usage: task-worktree models
 
   Print the model registry (.dispatch/models.json): the tiers, the mode->tier
   mapping, and what every mode resolves to RIGHT NOW (including \$TASK_TIER_*
-  env overrides). Read-only — it changes nothing.
+  env overrides) — including the two code keys, 'code' (open-ended, deep) and
+  'code-scoped' (create --scoped, standard). Read-only — it changes nothing.
 EOF
 }
 
@@ -435,7 +487,8 @@ Usage: task-worktree repair-models [<task-id> ...] [--dry-run]
 
   Backfills a concrete tier+model onto OPEN tasks whose latest created/handoff
   ledger record has NEITHER (they predate the model registry). Resolves from
-  the task's mode via .dispatch/models.json — the same resolution 'create' and
+  the task's mode (and its recorded scopedness/PR) via .dispatch/models.json —
+  the same resolution 'create' and
   'handoff' use (an autopiloted PR resolves through 'autopilot', not its mode)
   — then appends a durable 'model-backfilled' ledger event and patches
   TASK_TIER/TASK_MODEL into tasks/<id>/task.env when that dir still exists.
@@ -500,14 +553,15 @@ PY
     fi
     mode="$(jget "$rec" "d.get('mode') or 'code'")"
     pr="$(jget "$rec" "d.get('pr_number') or ''")"
-    model_key="$mode"
-    [ -n "$pr" ] && model_key="autopilot"
+    local scoped_flag=0
+    [ "$(jget "$rec" "'1' if d.get('scoped') else '0'")" = "1" ] && scoped_flag=1
+    model_key="$(_model_mode_key "$mode" "$pr" "$scoped_flag")"
     _resolve_model "$model_key" "" ""
     if [ -z "$RESOLVED_MODEL" ]; then
       printf '  %-34s mode=%-10s -> no resolvable model (registry/mode issue) skip\n' "$tid" "$mode"
       continue
     fi
-    printf '  %-34s mode=%-10s -> BACKFILL tier=%s model=%s\n' "$tid" "$mode" "$RESOLVED_TIER" "$RESOLVED_MODEL"
+    printf '  %-34s mode=%-10s -> BACKFILL tier=%s model=%s\n' "$tid" "$model_key" "$RESOLVED_TIER" "$RESOLVED_MODEL"
     [ "$dry" -eq 1 ] && continue
     changed=1
     ledger_append "$(python3 - "$tid" "$RESOLVED_TIER" "$RESOLVED_MODEL" "$(now)" <<'PY'
@@ -2064,7 +2118,8 @@ usage_create() {
   cat >&2 <<EOF
 Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
                             [--branch <name>] [--base <ref>] [--pr <n|url>]
-                            [--mode <mode>] [--tier <name>] [--model <id>]
+                            [--mode <mode>] [--scoped] [--tier <name>]
+                            [--model <id>]
                             [--agent <kind>] [--request "<your words>"]
                             [--prompt "<opening instruction>"] [--no-agent]
 
@@ -2091,8 +2146,17 @@ Usage: task-worktree create --slug <name> --repo <repo> [--repo <repo> ...]
   --skill    REQUIRED with --mode brainstorm, and only valid there. Which skills
              the session is briefed with: 'brainstorm', 'grill' or 'both'.
              There is no default on purpose: ASK THE HUMAN which they want.
+  --scoped   ASSERT that this code task is a small, well-specified change, or
+             the straight execution of an implementation plan you were handed.
+             It resolves to the STANDARD tier instead of code's DEEP default.
+             Open-ended work — anything with investigation, diagnosis or bug
+             hunting in it — must NOT be --scoped, even when the diff is small.
+             Never inferred: no --scoped, no discount. --mode code only; it is
+             a hard error for investigate/brainstorm and for --pr (autopilot
+             has its own tier).
   --tier     Model tier for the executor: any tier in .dispatch/models.json
-             (deep | standard | fast). Overrides the mode's default tier.
+             (deep | standard | fast). Overrides the mode's default tier and
+             --scoped.
   --model    Raw model id (provider/id) for the executor. Beats --tier.
              Both only apply to --kind pi; see 'task-worktree models'.
   --agent    Executor agent kind (default: \$TASK_AGENT_KIND or 'pi').
@@ -2105,11 +2169,12 @@ EOF
 cmd_create() {
   local slug="" branch="" base="" agent="$DEFAULT_AGENT_KIND"
   local request="" prompt="" no_agent=0 mode="code" pr="" skills=""
-  local tier="" model=""
+  local tier="" model="" scoped=0
   local -a repos=()
 
   while [ $# -gt 0 ]; do
     case "$1" in
+      --scoped)  scoped=1; shift ;;
       --tier)    tier="$2"; shift 2 ;;
       --model)   model="$2"; shift 2 ;;
       --skill)   skills="$2"; shift 2 ;;
@@ -2143,12 +2208,23 @@ cmd_create() {
     [ -z "$skills" ] || die "create: --skill only applies to --mode brainstorm (got --mode $mode)"
   fi
 
+  # --scoped is an assertion about CODE work only. Anywhere else it would be
+  # either meaningless (investigate/brainstorm are deep by nature) or a silent
+  # downgrade of a tier somebody else owns (autopilot), so it is refused loudly
+  # before anything is created.
+  if [ "$scoped" -eq 1 ]; then
+    [ "$mode" = "code" ] \
+      || die "create: --scoped only applies to --mode code (got --mode $mode)"
+    [ -z "$pr" ] \
+      || die "create: --scoped cannot be combined with --pr (an autopiloted PR has its own tier)"
+  fi
+
   # Which model the executor is spawned with. Resolved BEFORE anything is
   # created, so an unknown --tier costs nothing; a missing/malformed registry
   # only warns and falls through to the agent's own default. An autopiloted PR
-  # resolves through the 'autopilot' mode key, not 'code'.
-  local model_key="$mode"
-  [ -n "$pr" ] && model_key="autopilot"
+  # resolves through the 'autopilot' mode key, not 'code'; --scoped code
+  # resolves through 'code-scoped'.
+  local model_key; model_key="$(_model_mode_key "$mode" "$pr" "$scoped")"
   _resolve_model "$model_key" "$tier" "$model"
   local model_explicit=0
   { [ -n "$tier" ] || [ -n "$model" ]; } && model_explicit=1
@@ -2199,7 +2275,7 @@ cmd_create() {
     prompt="$(_brainstorm_prompt "$id" "${repos[0]}" "$branch" "$skills")"
   fi
 
-  info "task id: $id  branch: $branch  mode: $mode  repos: ${repos[*]}${skills:+  skills: $skills}"
+  info "task id: $id  branch: $branch  mode: $mode$([ "$scoped" -eq 1 ] && printf ' (scoped)')  repos: ${repos[*]}${skills:+  skills: $skills}"
 
   local task_dir="$TASKS_DIR/$id"
   [ -e "$task_dir" ] && die "task dir already exists: $task_dir"
@@ -2284,6 +2360,7 @@ TASK_PR_NUMBER="$PR_NUMBER"
 TASK_PR_URL="$PR_URL"
 TASK_TIER="$RESOLVED_TIER"
 TASK_MODEL="$RESOLVED_MODEL"
+TASK_SCOPED="$scoped"
 TASK_WORKTREE_BIN="$SELF"
 EOF
 
@@ -2349,15 +2426,16 @@ EOF
   entry="$(python3 - "$id" "$slug" "$branch" "$primary" "$agent" \
                     "$request" "$prompt" "$exec_wsid" "$mode" "$(now)" "$wts" \
                     "$dispatch_pane" "$task_compare" "$PR_NUMBER" "$PR_URL" "$skills" \
-                    "$RESOLVED_TIER" "$RESOLVED_MODEL" <<'PY'
+                    "$RESOLVED_TIER" "$RESOLVED_MODEL" "$scoped" <<'PY'
 import json, sys
 (id_, slug, branch, primary, agent, request, prompt, exec_ws, mode, ts, wts,
- pane, compare, pr_num, pr_url, skills, tier, model) = sys.argv[1:19]
+ pane, compare, pr_num, pr_url, skills, tier, model, scoped) = sys.argv[1:20]
 print(json.dumps({
     "event": "created",
     "id": id_, "slug": slug, "branch": branch, "primary_repo": primary,
     "agent_kind": agent, "mode": mode, "skills": skills or None,
     "tier": tier or None, "model": model or None,
+    "scoped": scoped == "1",
     "request": request, "prompt": prompt,
     "executor_workspace_id": exec_ws or None,
     "dispatch_pane": pane or None, "compare": compare or None,
@@ -2505,7 +2583,9 @@ Usage: task-worktree handoff <task-id> [--prompt "<opening instruction>"]
                recommended — the old agent's knowledge lives in the tree/notes,
                not in the discarded context.
   --agent      Executor kind for the fresh agent (default: the task's original).
-  --tier       Model tier for the fresh agent (default: the task's recorded one).
+  --tier       Model tier for the fresh agent (default: the task's recorded one,
+               so a --scoped task hands off to standard and an open-ended code
+               task to deep, without anyone having to remember which).
   --model      Raw model id for the fresh agent. Beats --tier.
 EOF
 }
@@ -2540,10 +2620,12 @@ cmd_handoff() {
   # Model: the SAME one the task was spawned with, unless the caller overrides
   # it here. Reusing the record means a handoff never silently changes the
   # model under a task; --model/--tier are the way to change it deliberately.
+  local scoped_flag=0
+  [ "$(jget "$rec" "'1' if d.get('scoped') else '0'")" = "1" ] && scoped_flag=1
   local model_explicit=0
   if [ -n "$model" ] || [ -n "$tier" ]; then
     model_explicit=1
-    _resolve_model "$(jget "$rec" "d.get('mode') or 'code'")" "$tier" "$model"
+    _resolve_model "$(_model_mode_key "$mode" "$(jget "$rec" "d.get('pr_number') or ''")" "$scoped_flag")" "$tier" "$model"
   else
     RESOLVED_TIER="$(jget "$rec" "d.get('tier') or ''")"
     RESOLVED_MODEL="$(jget "$rec" "d.get('model') or ''")"
@@ -2552,9 +2634,10 @@ cmd_handoff() {
       # through to the SAME mode-based resolution 'create' uses, rather than
       # silently handing the fresh executor pi's global default model (the
       # most expensive one). An autopiloted PR resolves through 'autopilot',
-      # exactly as 'create' does.
-      local legacy_mode_key; legacy_mode_key="$(jget "$rec" "d.get('mode') or 'code'")"
-      [ -n "$(jget "$rec" "d.get('pr_number') or ''")" ] && legacy_mode_key="autopilot"
+      # and a task recorded as --scoped through 'code-scoped', exactly as
+      # 'create' does. No recorded scopedness means plain 'code' (deep).
+      local legacy_mode_key
+      legacy_mode_key="$(_model_mode_key "$mode" "$(jget "$rec" "d.get('pr_number') or ''")" "$scoped_flag")"
       _resolve_model "$legacy_mode_key" "" ""
       [ -n "$RESOLVED_MODEL" ] \
         && info "handoff: task '$id' had no recorded model — resolved '$legacy_mode_key' -> $RESOLVED_MODEL (tier ${RESOLVED_TIER:-none})"
@@ -2654,6 +2737,9 @@ print(json.dumps({
     "agent_kind": o.get("agent_kind"),
     "mode": o.get("mode") or "code",
     "skills": o.get("skills"),
+    "scoped": bool(o.get("scoped")),
+    "pr_number": o.get("pr_number"),
+    "pr_url": o.get("pr_url"),
     "tier": tier or None, "model": model or None,
     "request": o.get("request"),
     "prompt": prompt,
@@ -3041,6 +3127,16 @@ def model_tag(o):
         return t[:9]
     m = o.get("model")
     return (m or "-")[:9]
+# WHY that tier: the code tier turns on how open-ended the work is, so the
+# assertion behind it is shown right next to the model column. 'scoped' means
+# the human asserted --scoped (cheap tier); 'open-ended' is code's default.
+def why_tag(o):
+    mode = o.get("mode") or "code"
+    if o.get("pr_number"):
+        return "autopilot"
+    if mode != "code":
+        return mode[:10]
+    return "scoped" if o.get("scoped") else "open-ended"
 for tid in order:
     o = state[tid]
     repos = ",".join(w_["repo"] for w_ in o.get("worktrees", [])) or "-"
@@ -3065,7 +3161,7 @@ for tid in order:
             tail = f"(wrapping up · skills: {skills} · writing its plan) " + tail
         elif status == "working":
             tail = f"(brainstorm session · skills: {skills}) " + tail
-    print(f"{tid:<{w}}  {status:<16}  {model_tag(o):<9}  {repos:<20}  {tail[:70]}")
+    print(f"{tid:<{w}}  {status:<16}  {model_tag(o):<9}  {why_tag(o):<10}  {repos:<20}  {tail[:70]}")
 PY
 }
 
@@ -3080,7 +3176,9 @@ Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|conte
 
   create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
             --mode code | investigate | brainstorm (brainstorm needs --skill).
-            --tier/--model pick the executor's model (see 'models').
+            --scoped asserts a code task is small/well-specified (standard tier
+            instead of code's deep default); --tier/--model still beat it
+            (see 'models').
   autopilot (EXECUTORS) Print the autopilot brief for THIS task's own PR, for
             an executor asked to babysit it in-lane. Spawns nothing.
   handoff   Baton-pass a task to a FRESH-context executor (same worktree/branch).

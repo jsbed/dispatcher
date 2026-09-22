@@ -5,7 +5,8 @@
     "fast":     "cursor/grok-4.6:fast"
   },
   "modes": {
-    "code": "standard",
+    "code": "deep",
+    "code-scoped": "standard",
     "autopilot": "standard",
     "investigate": "deep",
     "brainstorm": "deep"

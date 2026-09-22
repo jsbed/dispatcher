@@ -1521,9 +1521,11 @@ STD="anthropic/claude-sonnet-5"
 FAST="cursor/grok-4.6:fast"
 
 # ---- every mode spawns with its tier's model ------------------------------
+# Plain 'code' is OPEN-ENDED work (investigation/diagnosis/bug hunting) and is
+# deliberately deep; only an explicit --scoped buys the cheaper tier (sect 31).
 setup; models_sandbox; mk_repo widget
 TW create --slug m --repo widget >/dev/null 2>&1
-is "--mode code spawns with the 'standard' tier's model" "$(start_model)" "$STD"
+is "--mode code spawns with the 'deep' tier's model" "$(start_model)" "$DEEP"
 
 setup; models_sandbox; mk_repo widget
 TW create --slug m --repo widget --mode investigate >/dev/null 2>&1
@@ -1552,8 +1554,12 @@ TASK_TIER_FAST="acme/env-model" TW create --slug m --repo widget --tier fast >/d
 is "\$TASK_TIER_<NAME> re-points a tier" "$(start_model)" "acme/env-model"
 
 setup; models_sandbox; mk_repo widget
-TASK_TIER_STANDARD="acme/env-standard" TW create --slug m --repo widget >/dev/null 2>&1
-is "and re-points it for a mode default too" "$(start_model)" "acme/env-standard"
+TASK_TIER_DEEP="acme/env-deep" TW create --slug m --repo widget >/dev/null 2>&1
+is "and re-points it for a mode default too" "$(start_model)" "acme/env-deep"
+
+setup; models_sandbox; mk_repo widget
+TASK_TIER_STANDARD="acme/env-standard" TW create --slug m --repo widget --scoped >/dev/null 2>&1
+is "and for the scoped-code default too" "$(start_model)" "acme/env-standard"
 
 # ---- a broken registry NEVER blocks a spawn -------------------------------
 setup; models_sandbox; mk_repo widget; rm -f "$SANDBOX/.dispatch/models.json"
@@ -1624,7 +1630,7 @@ is "and the override is what the NEXT handoff reuses" "$(start_model)" "acme/han
 setup; models_sandbox
 out="$(TW models 2>&1)"; rc=$?
 is "'models' succeeds" "$rc" "0"
-for want in deep standard fast "$STD" 'code' 'autopilot' 'investigate' 'brainstorm'; do
+for want in deep standard fast "$STD" 'code' 'code-scoped' 'autopilot' 'investigate' 'brainstorm'; do
   case "$out" in *"$want"*) ok "'models' shows: $want" ;;
     *) bad "'models' shows: $want" "$out" ;; esac
 done
@@ -1657,7 +1663,7 @@ strip_task_model "$id"; strip_env_model "$id"
 case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"tier": null'*) ok "fixture: the record now has no tier" ;;
   *) bad "fixture: the record now has no tier" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
 TW handoff "$id" >/dev/null 2>&1
-is "handoff resolves the LEGACY task from its mode instead of the global default" "$(start_model)" "$STD"
+is "handoff resolves the LEGACY task from its mode instead of the global default" "$(start_model)" "$DEEP"
 
 # an autopiloted legacy task resolves through 'autopilot', not 'code'
 setup; models_sandbox; mk_repo widget feature-y; pr_fixture 9 OPEN feature-y
@@ -1679,23 +1685,23 @@ id="$(TW create --slug legacy3 --repo widget 2>/dev/null)"
 strip_task_model "$id"; strip_env_model "$id"
 
 out="$(TW repair-models --dry-run 2>&1)"
-case "$out" in *"BACKFILL tier=standard model=$STD"*) ok "--dry-run reports the backfill it WOULD make" ;;
+case "$out" in *"BACKFILL tier=deep model=$DEEP"*) ok "--dry-run reports the backfill it WOULD make" ;;
   *) bad "--dry-run reports the backfill it WOULD make" "$out" ;; esac
 case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *model-backfilled*) bad "--dry-run wrote nothing" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;;
   *) ok "--dry-run wrote nothing" ;; esac
 
 TW repair-models >/dev/null 2>&1
-case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"event": "model-backfilled"'*'"model": "'$STD'"'*) ok "the ledger records a model-backfilled event" ;;
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"event": "model-backfilled"'*'"model": "'$DEEP'"'*) ok "the ledger records a model-backfilled event" ;;
   *) bad "the ledger records a model-backfilled event" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
-is "task.env is patched with the resolved tier" "$(. "$SANDBOX/tasks/$id/task.env" 2>/dev/null; echo "${TASK_TIER:-}")" "standard"
-is "task.env is patched with the resolved model" "$(. "$SANDBOX/tasks/$id/task.env" 2>/dev/null; echo "${TASK_MODEL:-}")" "$STD"
-case "$(TW list 2>&1)" in *"$id"*standard*) ok "'list' now shows the backfilled tier" ;;
+is "task.env is patched with the resolved tier" "$(. "$SANDBOX/tasks/$id/task.env" 2>/dev/null; echo "${TASK_TIER:-}")" "deep"
+is "task.env is patched with the resolved model" "$(. "$SANDBOX/tasks/$id/task.env" 2>/dev/null; echo "${TASK_MODEL:-}")" "$DEEP"
+case "$(TW list 2>&1)" in *"$id"*deep*) ok "'list' now shows the backfilled tier" ;;
   *) bad "'list' now shows the backfilled tier" "$(TW list 2>&1)" ;; esac
 
 # now that the record is repaired, a plain handoff reuses IT (not a second
 # mode-fallback resolution) -- proven by an explicit override still winning
 TW handoff "$id" >/dev/null 2>&1
-is "and a subsequent handoff reuses the backfilled model" "$(start_model)" "$STD"
+is "and a subsequent handoff reuses the backfilled model" "$(start_model)" "$DEEP"
 
 # running it again is a no-op: already has a tier now
 before="$(grep -c model-backfilled "$SANDBOX/.dispatch/ledger.jsonl")"
@@ -1834,12 +1840,159 @@ case "$(TW watch --help 2>&1)" in *context-budget*) ok "watch --help documents t
   *) bad "watch --help documents the context-budget nudge" ;; esac
 }
 
+# ===========================================================================
+sect_31() {
+section "31. the code tier axis: open-ended (deep) vs --scoped (standard)"
+DEEP="anthropic/claude-opus-5"
+STD="anthropic/claude-sonnet-5"
+FAST="cursor/grok-4.6:fast"
+
+# ---- the axis itself ------------------------------------------------------
+# Code work is DEEP by default because the expensive axis is open-endedness
+# (investigation, diagnosis, bug hunting), not "does it touch the tree".
+setup; models_sandbox; mk_repo widget
+TW create --slug plain --repo widget >/dev/null 2>&1
+is "a plain code task is DEEP (open-ended by default)" "$(start_model)" "$DEEP"
+
+setup; models_sandbox; mk_repo widget
+TW create --slug tight --repo widget --scoped >/dev/null 2>&1
+is "--scoped resolves code to the STANDARD tier" "$(start_model)" "$STD"
+
+setup; models_sandbox; mk_repo widget
+TW create --slug tight --repo widget --mode code --scoped >/dev/null 2>&1
+is "--mode code --scoped is the same thing spelled out" "$(start_model)" "$STD"
+
+# autopilot is untouched by this change: it has its own tier.
+setup; models_sandbox; mk_repo widget feature-s; pr_fixture 11 OPEN feature-s
+TW create --repo widget --pr 11 >/dev/null 2>&1
+is "an autopiloted PR is STILL standard" "$(start_model)" "$STD"
+
+# ---- precedence: --model > --tier > --scoped > the mode default -----------
+setup; models_sandbox; mk_repo widget
+TW create --slug p --repo widget --scoped --tier fast >/dev/null 2>&1
+is "an explicit --tier beats --scoped" "$(start_model)" "$FAST"
+
+setup; models_sandbox; mk_repo widget
+TW create --slug p --repo widget --scoped --tier fast --model acme/exact >/dev/null 2>&1
+is "an explicit --model beats --tier and --scoped" "$(start_model)" "acme/exact"
+
+setup; models_sandbox; mk_repo widget
+TW create --slug p --repo widget --scoped --tier deep >/dev/null 2>&1
+is "--tier deep re-deepens a --scoped task" "$(start_model)" "$DEEP"
+
+# ---- the cheap path is NEVER inferred -------------------------------------
+# Nothing about the request may buy the discount: only the flag does.
+setup; models_sandbox; mk_repo widget
+TW create --slug x --repo widget --request "tiny one-line typo fix" \
+   --prompt "fix the typo" >/dev/null 2>&1
+is "a tiny-sounding request WITHOUT --scoped is still deep" "$(start_model)" "$DEEP"
+
+# ---- --scoped is refused where it is meaningless --------------------------
+for m in investigate brainstorm; do
+  setup; models_sandbox; mk_repo widget
+  extra=""; [ "$m" = brainstorm ] && extra="--skill grill"
+  out="$(TW create --slug r --repo widget --mode "$m" $extra --scoped 2>&1)"; rc=$?
+  is "--scoped is a hard error for --mode $m" "$rc" "1"
+  case "$out" in *'--scoped only applies to --mode code'*) ok "and the error says why ($m)" ;;
+    *) bad "and the error says why ($m)" "$out" ;; esac
+  is "and nothing is created for it ($m)" "$(grep -c '^WORKTREE' "$HERDR_STUB_LOG" | tr -d ' ')" "0"
+  is "and no agent is started ($m)" "$(starts)" "0"
+done
+
+setup; models_sandbox; mk_repo widget feature-t; pr_fixture 12 OPEN feature-t
+out="$(TW create --repo widget --pr 12 --scoped 2>&1)"; rc=$?
+is "--scoped is a hard error with --pr (autopilot owns its tier)" "$rc" "1"
+case "$out" in *'--scoped cannot be combined with --pr'*) ok "and the error says why (--pr)" ;;
+  *) bad "and the error says why (--pr)" "$out" ;; esac
+is "and no agent is started (--pr)" "$(starts)" "0"
+
+# ---- persisted: task.env, ledger, list ------------------------------------
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug tight --repo widget --scoped 2>/dev/null)"
+env_file="$SANDBOX/tasks/$id/task.env"
+is "task.env records the scopedness" "$(. "$env_file" 2>/dev/null; echo "${TASK_SCOPED:-}")" "1"
+is "task.env records the resolved tier" "$(. "$env_file" 2>/dev/null; echo "${TASK_TIER:-}")" "standard"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"scoped": true'*) ok "the ledger records scoped: true" ;;
+  *) bad "the ledger records scoped: true" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+case "$(TW list 2>&1)" in *"$id"*standard*scoped*) ok "'list' shows WHY it got sonnet ('scoped')" ;;
+  *) bad "'list' shows WHY it got sonnet ('scoped')" "$(TW list 2>&1)" ;; esac
+
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug plain --repo widget 2>/dev/null)"
+is "an unscoped task records TASK_SCOPED=0" "$(. "$SANDBOX/tasks/$id/task.env" 2>/dev/null; echo "${TASK_SCOPED:-}")" "0"
+case "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" in *'"scoped": false'*) ok "the ledger records scoped: false" ;;
+  *) bad "the ledger records scoped: false" "$(cat "$SANDBOX/.dispatch/ledger.jsonl")" ;; esac
+case "$(TW list 2>&1)" in *"$id"*deep*open-ended*) ok "'list' shows WHY it got opus ('open-ended')" ;;
+  *) bad "'list' shows WHY it got opus ('open-ended')" "$(TW list 2>&1)" ;; esac
+
+# ---- handoff preserves the recorded model in BOTH directions --------------
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug tight --repo widget --scoped 2>/dev/null)"
+TW handoff "$id" >/dev/null 2>&1
+is "a SCOPED task hands off to standard" "$(start_model)" "$STD"
+TW handoff "$id" >/dev/null 2>&1
+is "and stays standard across a second handoff" "$(start_model)" "$STD"
+case "$(TW list 2>&1)" in *scoped*) ok "and 'list' still says scoped after a handoff" ;;
+  *) bad "and 'list' still says scoped after a handoff" "$(TW list 2>&1)" ;; esac
+TW handoff "$id" --tier deep >/dev/null 2>&1
+is "handoff --tier still overrides a scoped task" "$(start_model)" "$DEEP"
+
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug plain --repo widget 2>/dev/null)"
+TW handoff "$id" >/dev/null 2>&1
+is "an UNSCOPED task hands off to deep" "$(start_model)" "$DEEP"
+TW handoff "$id" --tier standard >/dev/null 2>&1
+is "handoff --tier still overrides an unscoped task" "$(start_model)" "$STD"
+
+# ---- a record with no tier/model still resolves through its scopedness ----
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug tight --repo widget --scoped 2>/dev/null)"
+strip_task_model "$id"; strip_env_model "$id"
+TW handoff "$id" >/dev/null 2>&1
+is "a tier-less SCOPED record resolves through 'code-scoped'" "$(start_model)" "$STD"
+
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug plain --repo widget 2>/dev/null)"
+strip_task_model "$id"; strip_env_model "$id"
+TW handoff "$id" >/dev/null 2>&1
+is "a tier-less unscoped record resolves through 'code' (deep)" "$(start_model)" "$DEEP"
+
+# repair-models honours the same axis
+setup; models_sandbox; mk_repo widget
+id="$(TW create --slug tight --repo widget --scoped 2>/dev/null)"
+strip_task_model "$id"; strip_env_model "$id"
+out="$(TW repair-models --dry-run 2>&1)"
+case "$out" in *"BACKFILL tier=standard model=$STD"*) ok "repair-models backfills a scoped task at standard" ;;
+  *) bad "repair-models backfills a scoped task at standard" "$out" ;; esac
+
+# ---- an OLDER registry (no 'code-scoped' key) still spawns ----------------
+setup; models_sandbox; mk_repo widget
+printf '{"tiers":{"deep":"a/deep","standard":"a/std"},"modes":{"code":"standard"}}' \
+  > "$SANDBOX/.dispatch/models.json"
+err="$(TW create --slug tight --repo widget --scoped 2>&1 >/dev/null)"; rc=$?
+is "a registry without 'code-scoped' still spawns the task" "$rc" "0"
+is "falling back to the base 'code' mapping" "$(start_model)" "a/std"
+case "$err" in *"no 'code-scoped' key"*) ok "and says it fell back" ;;
+  *) bad "and says it fell back" "$err" ;; esac
+
+# ---- discoverability ------------------------------------------------------
+case "$(TW create --help 2>&1)" in *--scoped*) ok "create --help documents --scoped" ;;
+  *) bad "create --help documents --scoped" ;; esac
+case "$(TW help 2>&1)" in *--scoped*) ok "the top-level usage mentions --scoped" ;;
+  *) bad "the top-level usage mentions --scoped" ;; esac
+setup; models_sandbox
+case "$(TW models 2>&1)" in *code-scoped*standard*) ok "'models' shows the scoped-code resolution" ;;
+  *) bad "'models' shows the scoped-code resolution" "$(TW models 2>&1)" ;; esac
+case "$(TW models 2>&1)" in *--scoped*) ok "'models' explains that scopedness is never inferred" ;;
+  *) bad "'models' explains that scopedness is never inferred" "$(TW models 2>&1)" ;; esac
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
 # TASK_SELFTEST_SECTIONS narrows a run to named sections while debugging one;
 # unset (the default, and the gate) is every section.
-SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 30 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 29 24 0}"
+SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 30 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 29 31 24 0}"
 
 # ---------------------------------------------------------------------------
 # the runner

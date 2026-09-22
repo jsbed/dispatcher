@@ -62,7 +62,7 @@ bin/task-worktree create \
   --request "<the human's words>" \
   --prompt "<clear opening instruction for the executor>" \
   [--branch <name>] [--base <ref>] [--mode code|investigate|brainstorm] [--agent <kind>] \
-  [--tier deep|standard|fast] [--model <provider/id>]
+  [--scoped] [--tier deep|standard|fast] [--model <provider/id>]
 ```
 
 - The **slug** becomes `slug-<nonce>` (the task id) — reused for the branch, the
@@ -87,8 +87,10 @@ bin/task-worktree create \
 - Default agent kind is `pi` (override with `--agent` or `$TASK_AGENT_KIND`).
 - **The model comes from the registry — don't pick one unless the human does.**
   `.dispatch/models.json` maps **tiers** to models and **modes** to tiers
-  (`code`/`autopilot` → `standard`, `investigate`/`brainstorm` → `deep`), so a
-  plain `create` already runs on the right model. Override only on the human's
+  (`code` → `deep`, `code-scoped`/`autopilot` → `standard`,
+  `investigate`/`brainstorm` → `deep`), so a plain `create` already runs on the
+  right model. The one call **you** make is `--scoped` (see below). Override the
+  tier itself only on the human's
   word: `--tier <name>` (any tier in the registry) or `--model <provider/id>`,
   which beats `--tier`. `$TASK_TIER_<NAME>` re-points a tier for one run. A
   missing/malformed registry only warns and lets pi use its own default; an
@@ -96,12 +98,51 @@ bin/task-worktree create \
   to `--kind pi` executors. Run `bin/task-worktree models` to see what resolves
   to what right now — never hunt the file by hand. The resolved model/tier are
   recorded, so `handoff` restarts the **same** model (override with
-  `--tier`/`--model` there) and `list` shows it. A task created **before** this
+  `--tier`/`--model` there) and `list` shows it — a `--scoped` task hands off to
+  sonnet, an open-ended one to opus, with no bookkeeping from you. A task created
+  **before** this
   registry existed has no recorded tier/model; `handoff` on one of those falls
   through to resolving the task's **mode** (never pi's expensive global
   default), and `bin/task-worktree repair-models [--dry-run]` backfills the
   ledger record itself for every such open task in one pass — run it once if
   `list`'s model column shows `-` for an old task.
+
+### `--scoped`: the one model decision that is YOURS
+
+For **code tasks the tier turns on how OPEN-ENDED the work is**, not on how big
+the diff looks. Open-endedness is what burns turns: searching, forming
+hypotheses, being wrong, backtracking. So:
+
+- **Default (no flag) → `deep` (opus).** Anything that has to *find* something
+  out: bug fixes, diagnosis, "why is X slow/flaky/broken", refactors whose shape
+  isn't decided yet, "make X work", anything you'd have to explore to specify.
+- **`--scoped` → `standard` (sonnet).** An assertion, made by you, that the work
+  is *already specified*: a small, well-described change, or the **straight
+  execution of an implementation plan** the human handed over (e.g. the "Next
+  tasks" of a brainstorm plan, or a spec they wrote out).
+
+Crisp rules:
+
+1. **A given implementation plan usually means `--scoped`** — the thinking
+   already happened; the task is to carry it out.
+2. **UNLESS the plan itself contains investigation.** If a step says "find out",
+   "figure out why", "audit", "diagnose", or leaves a decision to the executor,
+   it is open-ended: **no `--scoped`**.
+3. **Bug fixing is never `--scoped`.** Neither is anything needing diagnosis —
+   however small the eventual fix turns out to be.
+4. **Never infer it from size.** Not from the slug, not from a short request, not
+   from "it's just one file". Only from the human's own specification.
+5. **When in doubt, do NOT pass `--scoped`.** Paying for opus on a task that
+   didn't need it costs money once; running sonnet on open-ended work costs a
+   wrong answer, a re-spawn, and the human's time.
+6. The human can always say so themselves ("this one's small", "just execute the
+   plan") — that is the clearest possible signal to pass it. They can also
+   override the tier outright with `--tier`/`--model`, which beats `--scoped`.
+
+`--scoped` is **code-only**: it is a hard error with `--mode investigate`,
+`--mode brainstorm` and with `--pr` (autopilot keeps its own `standard` tier,
+unchanged). `list` shows `scoped` / `open-ended` next to the model column, so
+you and the human can always see *why* a task got opus or sonnet.
 - The script creates worktrees via herdr, wires the symlink view, builds an
   isolated `tasks/<id>/` dir, boots the executor agent there, briefs it, and
   appends a ledger entry. It prints the task id on stdout.
@@ -128,6 +169,7 @@ the task and the executor runs the loop.
   ```
 
 - `--repo` defaults to **`core`** unless the human names another repo.
+- Autopilot keeps its own `standard` tier; **`--scoped` is refused with `--pr`**.
 - `--pr` owns the branch, the base and the brief: the worktree *is* the PR's head
   branch, and the executor is briefed from `.dispatch/autopilot.PROMPT.md`.
   **Do not invent `--branch`, `--base` or `--prompt`** — `--pr` refuses
@@ -209,6 +251,8 @@ wake), you persist it with `report --body-file reports/<YYYY-MM-DD>-<id>.executo
 task then **auto-closes** like `investigate` — the plan lives at
 `reports/<YYYY-MM-DD>-<id>.md`. Its "Next tasks" section is the human's menu of what to spawn
 next: surface it, and **wait for them to pick** — do not auto-spawn from it.
+When they do pick one, a step that is *straight execution of the plan* is the
+textbook `--scoped` case; a step that still says "find out why" is not.
 
 ## What lives where
 
@@ -220,6 +264,7 @@ tasks/<id>/                 ephemeral, symlink-only executor workspace
   AGENTS.md -> executor context
 .dispatch/ledger.jsonl      append-only intent + status log (source of "why")
 .dispatch/models.json       the model registry: tiers + mode->tier mapping
+                            (code=deep, code-scoped=standard, ...)
 .dispatch/task-executor.AGENTS.md   the executor contract
 .dispatch/autopilot.PROMPT.md       the --pr (autopilot) brief
 .dispatch/brainstorm.PROMPT.md      the brainstorm dialogue frame
