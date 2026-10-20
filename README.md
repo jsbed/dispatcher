@@ -14,6 +14,11 @@ executor finishes it reports back, and Dispatch surfaces the result to you.
 - **Executor** = worker. One task, one branch, one isolated worktree. Commits and
   pushes its own branch; never touches anything outside its lane.
 - **Ledger** = an append-only log of *why* each task exists and its status history.
+- **The target repo's own docs are context.** An executor reads that repo's
+  `README.md` / `AGENTS.md` (root and nested) before it writes anything, and
+  **the repo's conventions outrank the task brief's phrasing** on mechanics. So
+  briefs stay about *what* to achieve, and nobody hand-copies a repo's build and
+  style rules into a prompt where they would go stale.
 
 ## One command runs everything
 

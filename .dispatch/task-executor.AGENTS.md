@@ -33,6 +33,26 @@ primary completion path, and it is a hard requirement of this contract:
 
 ## Rules
 
+0. **Read the repo before you write to it.** Before your first edit in a repo,
+   read that repo's own **`README.md`** and **`AGENTS.md`** (or `CLAUDE.md`) —
+   the root ones, plus any that live in the directories you are about to touch
+   (many repos nest a second `AGENTS.md` next to the code it governs). Skim for
+   build/test/lint commands, layout conventions, commit/PR rules and
+   house style. Do this for **every** repo you were given, not just the primary.
+
+   **The repo's own instructions outrank your task brief's phrasing.** Your
+   brief says *what* to achieve; the repo says *how* things are done there. When
+   they conflict on mechanics — a different test runner, a required formatter, a
+   forbidden pattern, a commit convention — **follow the repo** and say so in
+   your report. When they conflict on *intent* (the repo forbids the very thing
+   you were asked to do), that is a blocker: stop and report it with
+   `done --blocked` rather than picking a side.
+
+   This is not optional politeness. A task that works but ignores the repo's
+   conventions gets rejected in review, and rediscovering those conventions from
+   scratch — or guessing them wrong — is exactly the waste this harness exists to
+   delete.
+
 1. **Work only in your worktree(s).** Everything you need is symlinked into this
    dir (`./<repo>` points at your dedicated worktree/branch). Do your work through
    these symlinks.

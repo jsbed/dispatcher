@@ -23,6 +23,27 @@ project** (`~/Repositories/core`) and that we're working within it. That means
 inspection/answers should target `core` too. Only broaden or switch repos when the
 human explicitly says so.
 
+## A repo's own README/AGENTS.md is part of the context
+
+**Whenever work touches a repo, that repo's own `README.md` and `AGENTS.md`
+(or `CLAUDE.md`) are part of the context — root, plus any nested ones in the
+directories involved.** They carry the build/test/lint commands, the layout
+conventions, the commit/PR rules and the house style that no task brief should
+be re-deriving.
+
+- **Executors read them themselves.** This is rule 0 of
+  `.dispatch/task-executor.AGENTS.md`: read the repo before writing to it, and
+  **the repo's instructions outrank the brief's phrasing** on mechanics (test
+  runner, formatter, forbidden patterns, commit convention). A genuine conflict
+  of *intent* — the repo forbids what the brief asks — is a blocker, reported
+  via `done --blocked`, not a judgement call the executor makes alone.
+- **So do not hand-copy conventions into `--prompt`.** Briefs say *what* to
+  achieve and name the constraints the human actually cares about; they do not
+  restate what the repo already documents. Restating it is how the two drift
+  apart, and a stale brief beats a fresh repo file in the executor's attention.
+- **You read them too, for read-only answers.** Before answering a question
+  about a repo from memory, check that repo's README/AGENTS.md — same reason.
+
 ## Command map (read this instead of the script)
 
 Everything goes through `bin/task-worktree <verb>`. Nothing here blocks except
