@@ -114,6 +114,13 @@ agent)
       printf '%s{"agent":"pi","agent_status":"%s","state_change_seq":%s,"name":"%s","pane_id":"p1","cwd":"/x"}' "$sep" "$1" "$2" "$(basename "$f")"
       sep=","
     done
+    # Opt-in: a live, UNNAMED agent rooted at the Dispatch root — what
+    # _discover_dispatch_pane looks for. HERDR_STUB_DISPATCH_PANE is its pane
+    # id, HERDR_STUB_DISPATCH_CWD its cwd (the sandbox root).
+    if [ -n "${HERDR_STUB_DISPATCH_PANE:-}" ]; then
+      printf '%s{"agent":"pi","agent_status":"idle","state_change_seq":1,"pane_id":"%s","cwd":"%s"}' \
+        "$sep" "$HERDR_STUB_DISPATCH_PANE" "${HERDR_STUB_DISPATCH_CWD:-/nowhere}"
+    fi
     printf ']}}\n'
     ;;
   wait)
@@ -684,6 +691,129 @@ is "a repeated 'done' in the same settle is suppressed" "$(settles)" "1"
 
 TW done "$AID" --note "forced" --force >/dev/null 2>&1
 is "--force overrides the claim" "$(settles)" "2"
+}
+
+# ===========================================================================
+sect_33() {
+section "33. wake routing: a DEAD Dispatch pane falls back to the live one"
+# Every task records the Dispatch pane it was created from (task.env, ledger,
+# and the watcher's --dispatch-pane argv). Dispatch moves: it restarts, or a
+# dispatch-handoff successor runs in a new pane. A wake aimed at a pane that no
+# longer exists used to be retried into the void and dropped. The live layout
+# comes from 'herdr pane list' (HERDR_STUB_PANES); the live Dispatch from
+# 'herdr agent list' (HERDR_STUB_DISPATCH_PANE).
+local_wakes() { grep -c "^PROMPT	$1" "$HERDR_STUB_LOG" 2>/dev/null | tr -d ' '; }
+env_pane()    { sed -n 's/^TASK_DISPATCH_PANE="\(.*\)"$/\1/p' "$SANDBOX/tasks/$AID/task.env"; }
+routing_log() { cat "$SANDBOX/.dispatch/logs/wake-routing.log" 2>/dev/null; }
+
+# ---- no pane listing at all: the recorded pane is trusted, as before -------
+setup; seq_state "$AID" working 330
+unset HERDR_STUB_PANES HERDR_STUB_DISPATCH_PANE
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+TW done "$AID" --note "no listing" >/dev/null 2>&1
+is "no pane listing: the recorded pane is still woken (never guessed dead)" "$(local_wakes wDISPATCH:p1)" "1"
+
+# ---- a LIVE recorded pane is used as-is, untouched ------------------------
+setup; seq_state "$AID" working 331
+export HERDR_STUB_PANES="wDISPATCH:p1 wNEW:p2 p1"
+export HERDR_STUB_DISPATCH_PANE="wNEW:p2" HERDR_STUB_DISPATCH_CWD="$(cd "$SANDBOX" && pwd)"
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+TW done "$AID" --note "live pane" >/dev/null 2>&1
+is "a live recorded pane is woken" "$(local_wakes wDISPATCH:p1)" "1"
+is "and the discovered pane is not" "$(local_wakes wNEW:p2)" "0"
+is "and task.env is left alone" "$(env_pane)" "wDISPATCH:p1"
+
+# ---- executor 'done': dead recorded pane -> the live Dispatch -------------
+setup; seq_state "$AID" working 332
+export HERDR_STUB_PANES="wNEW:p2 p1"              # wDISPATCH:p1 is GONE
+export HERDR_STUB_DISPATCH_PANE="wNEW:p2" HERDR_STUB_DISPATCH_CWD="$(cd "$SANDBOX" && pwd)"
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+out="$(TW done "$AID" --note "rerouted" 2>&1)"
+is "done: the settle is recorded" "$(settles)" "1"
+is "done: the LIVE Dispatch is woken" "$(local_wakes wNEW:p2)" "1"
+is "done: the dead pane is never prompted" "$(local_wakes wDISPATCH:p1)" "0"
+is "done: task.env is repaired to the live pane (resolved once)" "$(env_pane)" "wNEW:p2"
+case "$(routing_log)" in *wDISPATCH:p1*wNEW:p2*) ok "done: the reroute is logged durably (wake-routing.log)" ;;
+  *) bad "done: the reroute is logged durably (wake-routing.log)" "$(routing_log)" ;; esac
+case "$out" in *wDISPATCH:p1*wNEW:p2*) ok "done: the reroute is announced on stderr" ;;
+  *) bad "done: the reroute is announced on stderr" "$out" ;; esac
+
+# ---- a STALE watcher argv: --dispatch-pane names the dead pane forever ----
+# (a detached watcher armed hours ago cannot have its argv rewritten). The
+# repaired task.env must win over the dead explicit pane without rediscovery.
+seq_state "$AID" idle 333
+export HERDR_STUB_DISPATCH_PANE=""               # discovery would now FAIL
+TW notify-settle "$AID" --by watcher --force --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1
+is "stale watcher argv: the repaired task.env pane is woken" "$(local_wakes wNEW:p2)" "2"
+is "stale watcher argv: the dead pane is still never prompted" "$(local_wakes wDISPATCH:p1)" "0"
+
+# ---- a SECOND move (a later dispatch-handoff): re-discovered and re-repaired
+setup; seq_state "$AID" working 334
+export HERDR_STUB_PANES="wNEWER:p3 p1"
+export HERDR_STUB_DISPATCH_PANE="wNEWER:p3" HERDR_STUB_DISPATCH_CWD="$(cd "$SANDBOX" && pwd)"
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wNEW:p2"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+TW notify-settle "$AID" --by watcher --dispatch-pane wDISPATCH:p1 >/dev/null 2>&1
+is "every recorded pane dead: the live Dispatch is discovered and woken" "$(local_wakes wNEWER:p3)" "1"
+is "and task.env follows it" "$(env_pane)" "wNEWER:p3"
+
+# ---- no task.env at all: the ledger's pane is checked the same way --------
+setup; seq_state "$AID" working 335
+export HERDR_STUB_PANES="wNEW:p2 p1"
+export HERDR_STUB_DISPATCH_PANE="wNEW:p2" HERDR_STUB_DISPATCH_CWD="$(cd "$SANDBOX" && pwd)"
+TW done "$AID" --note "ledger pane only" >/dev/null 2>&1
+is "ledger-only dead pane: the live Dispatch is woken" "$(local_wakes wNEW:p2)" "1"
+
+# ---- NO Dispatch anywhere: never silent, never retried into the void ------
+setup; seq_state "$AID" working 336
+export HERDR_STUB_PANES="p1"
+export HERDR_STUB_DISPATCH_PANE=""
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+out="$(TW done "$AID" --note "nobody home" 2>&1)"
+is "no Dispatch: the settle is STILL recorded in the ledger" "$(settles)" "1"
+is "no Dispatch: nothing is prompted (no wasted retries on a dead pane)" "$(wakes)" "0"
+case "$out" in *"WAKE LOST"*) ok "no Dispatch: it says so LOUDLY on stderr" ;;
+  *) bad "no Dispatch: it says so LOUDLY on stderr" "$out" ;; esac
+case "$(routing_log)" in *"WAKE LOST"*"$AID"*) ok "no Dispatch: the lost wake is logged durably" ;;
+  *) bad "no Dispatch: the lost wake is logged durably" "$(routing_log)" ;; esac
+if grep -q '^NOTIFY.*Dispatch' "$HERDR_STUB_LOG"; then ok "no Dispatch: the human gets a desktop notification about it"
+else bad "no Dispatch: the human gets a desktop notification about it" "$(cat "$HERDR_STUB_LOG")"; fi
+is "no Dispatch: task.env is not clobbered" "$(env_pane)" "wDISPATCH:p1"
+
+# ---- a pane that still exists but holds NO agent (Dispatch exited) --------
+# Real herdr lists such a pane with agent_status but no 'agent'. Simulated by a
+# per-case herdr shim in front of the stub (the shared stub stays minimal).
+setup; seq_state "$AID" working 337
+unset HERDR_STUB_PANES
+export HERDR_STUB_DISPATCH_PANE="wNEW:p2" HERDR_STUB_DISPATCH_CWD="$(cd "$SANDBOX" && pwd)"
+mkdir -p "$SANDBOX/shim"
+cat > "$SANDBOX/shim/herdr" <<SHIM
+#!/usr/bin/env bash
+if [ "\$1 \$2" = "pane list" ]; then
+  echo '{"result":{"panes":[{"pane_id":"wDISPATCH:p1","agent_status":"unknown"},{"pane_id":"wNEW:p2","agent":"pi","agent_status":"idle"}]}}'
+  exit 0
+fi
+exec "$STUB_BIN/herdr" "\$@"
+SHIM
+chmod +x "$SANDBOX/shim/herdr"
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+PATH="$SANDBOX/shim:$PATH" TW done "$AID" --note "agentless pane" >/dev/null 2>&1
+is "an agentless (shell-only) pane counts as dead: the live Dispatch is woken" "$(local_wakes wNEW:p2)" "1"
+is "and the agentless pane is not prompted" "$(local_wakes wDISPATCH:p1)" "0"
+
+# ---- live BACKSTOP watcher armed with a pane that has since died ----------
+setup; seq_state "$AID" working 340
+export HERDR_STUB_PANES="wNEW:p2 p1"
+export HERDR_STUB_DISPATCH_PANE="wNEW:p2" HERDR_STUB_DISPATCH_CWD="$(cd "$SANDBOX" && pwd)"
+printf 'TASK_ID="%s"\nTASK_DISPATCH_PANE="wDISPATCH:p1"\n' "$AID" > "$SANDBOX/tasks/$AID/task.env"
+no_pi_session
+start_watcher                                     # argv: --dispatch-pane wDISPATCH:p1
+wait_watcher_armed
+seq_state "$AID" idle 341
+wait_settles 1
+wait_until '[ "$(local_wakes wNEW:p2)" -ge 1 ]'
+is "live watcher: its settle wakes the LIVE Dispatch" "$(local_wakes wNEW:p2)" "1"
+is "live watcher: the dead armed-with pane is never prompted" "$(local_wakes wDISPATCH:p1)" "0"
+unset HERDR_STUB_PANES HERDR_STUB_DISPATCH_PANE HERDR_STUB_DISPATCH_CWD
 }
 
 # ===========================================================================
@@ -2154,7 +2284,7 @@ case "$agents" in *"dispatch-handoff"*"DISPATCH-HANDOFF.md"*) ok "AGENTS.md docu
 # out of the gate first and the cheap ones backfill around them.
 # TASK_SELFTEST_SECTIONS narrows a run to named sections while debugging one;
 # unset (the default, and the gate) is every section.
-SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 30 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 29 31 32 24 0}"
+SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 30 33 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 29 31 32 24 0}"
 
 # ---------------------------------------------------------------------------
 # the runner

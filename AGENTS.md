@@ -363,6 +363,13 @@ bin/migrate-report-filenames  one-off: renames pre-dating reports into the schem
   `bin/task-worktree list` still shows it, and you'll catch it on the human's
   next turn. Do NOT ask the human whether to wait — let them carry on; you'll be
   woken automatically.
+- **Wakes follow you to whatever pane you are in now.** A task records the
+  pane Dispatch had when it was created, but a wake to a pane that is gone (or
+  holds no agent) falls back to the live Dispatch and repairs that task's
+  `task.env`. So a restarted or successor Dispatch still gets every wake. If
+  no Dispatch is found the wake is logged as `WAKE LOST` in
+  `.dispatch/logs/wake-routing.log`; the settle is still in the ledger, so
+  `list` shows it.
 - **If the ledger looks wrong, reconcile it.** `bin/task-worktree reconcile`
   (add `--dry-run` to look first) compares every open task against live herdr
   agent state and repairs tasks stuck at `working` whose agent is actually idle

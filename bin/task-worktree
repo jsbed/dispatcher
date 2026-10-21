@@ -1103,21 +1103,122 @@ _task_field() {
   jget "$rec" "d.get('$2') or ''" 2>/dev/null || true
 }
 
-# _resolve_dispatch_pane <id> -> the pane to wake.
+# _wake_route_log <msg> — wake-routing events are rare and matter: say them on
+# stderr (the watcher's log, or the executor's terminal) AND append them to one
+# durable, workspace-wide log, whichever path (done / watcher) hit them.
+_wake_route_log() {
+  info "$*"
+  mkdir -p "$LOG_DIR" 2>/dev/null || true
+  printf '%s %s\n' "$(now)" "$*" >> "$LOG_DIR/wake-routing.log" 2>/dev/null || true
+}
+
+# _repair_task_env_pane <id> <pane> — point task.env at the pane that actually
+# answered, so the next wake resolves it first time instead of falling back
+# again. A detached watcher's --dispatch-pane argv cannot be rewritten, which
+# is why _resolve_dispatch_pane looks past a DEAD explicit pane to task.env.
+_repair_task_env_pane() {
+  local f="$TASKS_DIR/$1/task.env"
+  [ -f "$f" ] && [ -n "$2" ] || return 0
+  python3 - "$f" "$2" <<'PY' || true
+import re, sys
+p, pane = sys.argv[1:3]
+s = open(p).read()
+line = 'TASK_DISPATCH_PANE="%s"' % pane
+if re.search(r'^TASK_DISPATCH_PANE=', s, flags=re.M):
+    s = re.sub(r'^TASK_DISPATCH_PANE=.*$', line, s, flags=re.M)
+else:
+    s = s.rstrip("\n") + "\n" + line + "\n"
+open(p, "w").write(s)
+PY
+}
+
+# _resolve_dispatch_pane <id> [<explicit-pane>] -> the pane to wake, or "".
+#
 # Deliberately does NOT consult $HERDR_PANE_ID: when an EXECUTOR runs `done`,
 # that variable points at the executor's own pane, which would wake the wrong
-# agent. Resolution order: explicit arg > task.env > ledger > live discovery.
+# agent.
+#
+# The RECORDED panes (explicit arg > \$TASK_DISPATCH_PANE > task.env > ledger)
+# are the panes Dispatch lived in when the task was created. Dispatch moves:
+# it restarts, or a dispatch-handoff successor runs in a new pane. So each
+# recorded pane is checked against ONE 'herdr pane list' and the first one that
+# is still alive wins; a pane that is gone, or that survives only as a shell
+# whose agent has exited, is skipped. When every recorded pane is dead the live
+# Dispatch is DISCOVERED, and task.env is repaired to it so the fallback
+# happens once, not on every wake. Lives here, not in a caller, so BOTH wake
+# paths ('done' and the backstop watcher, however long ago it was armed) and
+# 'handoff' get it.
+#
+# Never guesses a pane dead: if herdr cannot list panes, the first recorded
+# pane is trusted exactly as before. Prints "" (and says so loudly) only when
+# recorded panes are positively dead AND no live Dispatch can be discovered.
 _resolve_dispatch_pane() {
-  local id="$1" explicit="${2:-}" p=""
-  [ -n "$explicit" ] && { printf '%s\n' "$explicit"; return 0; }
-  [ -n "${TASK_DISPATCH_PANE:-}" ] && { printf '%s\n' "$TASK_DISPATCH_PANE"; return 0; }
+  local id="$1" explicit="${2:-}" envp="${TASK_DISPATCH_PANE:-}" taskp="" ledp=""
   if [ -n "$id" ] && [ -f "$TASKS_DIR/$id/task.env" ]; then
-    p="$(. "$TASKS_DIR/$id/task.env" >/dev/null 2>&1; printf '%s' "${TASK_DISPATCH_PANE:-}")"
-    [ -n "$p" ] && { printf '%s\n' "$p"; return 0; }
+    taskp="$(. "$TASKS_DIR/$id/task.env" >/dev/null 2>&1; printf '%s' "${TASK_DISPATCH_PANE:-}")"
   fi
-  [ -n "$id" ] && p="$(_task_field "$id" dispatch_pane)"
-  [ -n "$p" ] && { printf '%s\n' "$p"; return 0; }
-  _discover_dispatch_pane
+  [ -n "$id" ] && ledp="$(_task_field "$id" dispatch_pane)"
+
+  local listing verdict live dead found
+  listing="$(herdr pane list 2>/dev/null)" || listing=""
+  verdict="$(python3 - "$listing" "$explicit" "$envp" "$taskp" "$ledp" <<'PY'
+import json, sys
+listing, cands = sys.argv[1], sys.argv[2:]
+panes = None    # None = no usable listing: never declare anything dead
+try:
+    lst = json.loads(listing)["result"]["panes"]
+    if lst:
+        panes = dict((p["pane_id"], p) for p in lst)
+except Exception:
+    pass
+def dead(p):
+    if panes is None:
+        return False
+    e = panes.get(p)
+    if e is None:
+        return True                                  # the pane is gone
+    # still there, but only as a shell: herdr reports a status, no agent
+    return "agent_status" in e and not e.get("agent")
+seen, gone = [], []
+for c in cands:
+    if not c or c in seen:
+        continue
+    seen.append(c)
+    if dead(c):
+        gone.append(c)
+        continue
+    print("%s\t%s" % (c, " ".join(gone)))
+    sys.exit(0)
+print("\t%s" % " ".join(gone))
+PY
+)"
+  live="$(printf '%s' "$verdict" | cut -f1)"
+  dead="$(printf '%s' "$verdict" | cut -f2)"
+
+  if [ -n "$live" ]; then
+    # A dead pane was skipped in favour of a recorded one that answers (a stale
+    # watcher argv after task.env was repaired). Bring task.env along if it is
+    # the one that is stale.
+    if [ -n "$dead" ]; then
+      _wake_route_log "wake routing for ${id:-?}: Dispatch pane(s) [$dead] are gone or hold no agent — using recorded pane $live"
+      [ "$taskp" = "$live" ] || _repair_task_env_pane "$id" "$live"
+    fi
+    printf '%s\n' "$live"; return 0
+  fi
+
+  found="$(_discover_dispatch_pane)"
+  if [ -n "$found" ]; then
+    if [ -n "$dead" ]; then
+      local fixed=""
+      [ -n "$id" ] && [ -f "$TASKS_DIR/$id/task.env" ] && fixed=" (task.env repaired)"
+      _wake_route_log "wake routing for ${id:-?}: Dispatch pane(s) [$dead] are gone or hold no agent — rerouted to the live Dispatch $found$fixed"
+      _repair_task_env_pane "$id" "$found"
+    fi
+    printf '%s\n' "$found"; return 0
+  fi
+  [ -n "$dead" ] && \
+    _wake_route_log "wake routing for ${id:-?}: Dispatch pane(s) [$dead] are gone or hold no agent, and NO live Dispatch agent was found at $ROOT"
+  return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -1486,9 +1587,15 @@ PY
     --body "${note:-Recorded to ledger — Dispatch will report.}" >/dev/null 2>&1 || true
 
   # 4. Wake Dispatch — retried so a transient busy state can't swallow it.
+  #    The pane is checked for liveness and falls back to the live Dispatch
+  #    (see _resolve_dispatch_pane), so a moved/replaced Dispatch still hears.
   local pane; pane="$(_resolve_dispatch_pane "$id" "$pane_arg")"
   if [ -z "$pane" ]; then
-    info "warning: could not resolve the Dispatch pane; settle is recorded in the ledger only"
+    # Never silent: the settle IS durable in the ledger, but nobody was woken.
+    _wake_route_log "WAKE LOST: no live Dispatch pane for $id settle #$epoch ($status) — it is recorded in the ledger only; run 'bin/task-worktree list' from a Dispatch session to pick it up"
+    herdr notification show "Dispatch NOT woken for $id" \
+      --body "no live Dispatch pane found — the settle is in the ledger; run bin/task-worktree list" \
+      >/dev/null 2>&1 || true
     return 0
   fi
   local msg
@@ -1522,8 +1629,12 @@ PY
       return 0
     }
     sleep "${TASK_WAKE_RETRY_SLEEP_S:-10}"
+    # The pane may have died between resolving and prompting: re-check it
+    # (cheap) rather than retrying a dead pane.
+    local again; again="$(_resolve_dispatch_pane "$id" "$pane")"
+    [ -n "$again" ] && pane="$again"
   done
-  info "warning: could not wake Dispatch ($pane) after 5 attempts; settle #$epoch is still recorded in the ledger"
+  _wake_route_log "WAKE LOST: could not wake Dispatch ($pane) for $id after 5 attempts; settle #$epoch is recorded in the ledger only"
 }
 
 # ---------------------------------------------------------------------------

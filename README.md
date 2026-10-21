@@ -232,6 +232,17 @@ sit together, and later settles rewrite the same file instead of scattering
 new names across the days they happened on. `create` writes a `task.env` into the task workspace
 so the executor knows its own id and which pane to wake — no guessing.
 
+That pane is where Dispatch lived **when the task was created**, and Dispatch
+moves (it restarts, or a successor session takes over in another pane). So every
+wake first checks the recorded pane against `herdr pane list`: if it is gone, or
+survives only as a shell whose agent exited, the wake falls back to the live
+Dispatch (the unnamed agent rooted at this directory) and `task.env` is repaired
+to it, so the fallback happens once. This lives in the shared wake path, so the
+executor's `done`, a backstop watcher armed hours ago and `handoff` all get it.
+If no Dispatch can be found at all, the settle is still in the ledger and the
+wake is reported as `WAKE LOST` on stderr, in a desktop notification and in
+`.dispatch/logs/wake-routing.log`, which records every reroute too.
+
 A detached `bin/task-worktree watch <id>` runs as a **backstop** for the case
 where an executor dies or forgets. Both paths take the same per-task *settle
 claim* before recording anything, so **Dispatch is woken exactly once per
