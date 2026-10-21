@@ -22,6 +22,8 @@
 #   remove    Tear down a task: herdr worktrees, symlinks, task dir, ledger.
 #   prune     Garbage-collect dangling worktree symlinks + unused repo symlinks.
 #   list      Show current task status derived from the ledger.
+#   dispatch-handoff  DISPATCH hands off ITS OWN context: write the successor
+#             briefing (judgement + generated ledger snapshot). NOT 'handoff'.
 #   help      Show usage.
 #
 # CONTEXT-BUDGET HANDOFF (cost control)
@@ -3059,6 +3061,632 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+# dispatch-handoff — DISPATCH hands off ITS OWN context to a successor session
+#
+# NOT the same thing as 'handoff <id>' (which swaps a task's EXECUTOR). This is
+# the orchestrator's baton pass: the outgoing Dispatch session writes the
+# briefing a brand-new Dispatch session needs to carry on with zero questions.
+#
+# The briefing has two halves, and the split is the whole design:
+#   JUDGEMENT  — what lives ONLY in Dispatch's live context and dies with it:
+#                the state in one paragraph, per-task notes, decisions pending on
+#                the human, the recommended next sequence, traps, process
+#                lessons, which documents to read first. Dispatch writes these
+#                (--template gives the skeleton) and the verb REFUSES a body that
+#                skips a section, leaves a template marker or filler behind,
+#                forgets an open task, or cites a reports/ file that does not
+#                exist.
+#   MECHANICAL — everything recoverable from the ledger and reports/: open tasks
+#                with status/mode/tier/branch/PR/compare/live agent state, the
+#                original human requests, latest notes, what needs Dispatch
+#                action, recently closed work, the reports index. Generated here,
+#                never hand-assembled, so it cannot be wrong or stale at write
+#                time.
+#
+# Artifact: reports/<YYYY-MM-DD>-dispatch-handoff-<HHMM>.md (local time), plus
+# the stable pointer reports/DISPATCH-HANDOFF.md -> the latest one, which is
+# the one path a successor is ever told. A hand-written regular file at the
+# pointer path (pre-verb) is archived under a dated name, never overwritten.
+# reports/ is gitignored on purpose: a handoff is workspace state, not tooling.
+#
+# It is READ-ONLY on task state: no ledger event, no herdr mutation, no task is
+# stopped or touched. The only herdr call is a status snapshot per open task.
+# ---------------------------------------------------------------------------
+DH_POINTER_NAME="DISPATCH-HANDOFF.md"
+
+usage_dispatch_handoff() {
+  cat >&2 <<EOF
+Usage: task-worktree dispatch-handoff --template
+       task-worktree dispatch-handoff --body-file <path> [--dry-run]
+
+  DISPATCH hands off ITS OWN context to a fresh Dispatch session. Not to be
+  confused with 'handoff <task-id>', which swaps a task's EXECUTOR.
+
+  Run it when the human says "handoff the dispatcher context" (or similar).
+  It writes a successor briefing in two halves:
+
+    judgement   YOU write it: only your live context knows it. Start from
+                --template; every section below is REQUIRED:
+                  ## State                             one paragraph, no list
+                  ## Task notes                        every OPEN task id, each
+                                                       with what the ledger
+                                                       cannot say about it
+                  ## Decisions waiting on the human    may be "None."
+                  ## Next sequence                     ordered, with the why
+                  ## Traps                             may be "None."
+                  ## Process lessons                   may be "None."
+                  ## Read first                        documents + why; may be
+                                                       "None."
+    mechanical  GENERATED from the ledger + reports/ + a herdr snapshot: open
+                tasks (status, live agent, mode, tier, branch, PR/compare),
+                the human's original requests, latest notes, what needs
+                Dispatch action, recently closed work, the reports index.
+
+  The body is REFUSED (nothing written, rc 2) when a required section is
+  missing or empty, a template <<FILL ...>> marker or TODO/TBD/FIXME/XXX is
+  left in it, State or Next sequence is a bare "None", an open task id is
+  absent from Task notes, or it cites a reports/... file that does not exist.
+
+  Output: reports/<YYYY-MM-DD>-dispatch-handoff-<HHMM>.md (local time), and
+  the pointer reports/$DH_POINTER_NAME is re-pointed at it. A hand-written
+  regular file at the pointer path is archived under a dated name first.
+  Prints the written path on stdout. Task state is never touched.
+
+  The successor's opening move is then simply:
+    Read reports/$DH_POINTER_NAME — that's your state.
+
+  --template   Print the judgement skeleton (with the current open task ids
+               pre-listed under Task notes) to stdout. Writes nothing.
+  --body-file  Your filled-in judgement markdown. An optional leading
+               "# <title>" line becomes the document title.
+  --dry-run    Validate and print the composed document; write nothing.
+EOF
+}
+
+# _dh_py <op> ... — the one python program behind dispatch-handoff.
+#   op=open-ids  <ledger>                      -> open task ids, one per line
+#   op=template  <ledger> <live-tsv>           -> the judgement skeleton
+#   op=compose   <ledger> <live-tsv> <root> <reports> <body> <prev-display>
+#                <generated-local>             -> the full document, rc 2 + a
+#                                                 reason list on refusal
+# Defined as a function (never called from inside a heredoc in a $(...)) so
+# the bash 3.2 quote-scanning trap cannot bite.
+_dh_py() {
+  python3 - "$@" <<'PY'
+import json, os, re, sys
+
+op, ledger = sys.argv[1], sys.argv[2]
+
+SECTIONS = [
+    # (heading, may be a bare "None", template guidance)
+    ("State", False,
+     "ONE paragraph: what we are building/doing, where it stands, what is "
+     "blocking. Prose, not a list. The successor reads this first."),
+    ("Task notes", False,
+     "EVERY open task id below, each with what the ledger cannot say: what it "
+     "really is, whether its work is live, stale, dead or salvageable, who is "
+     "talking to it, what it is waiting on. Add a bullet for anything else in "
+     "flight that the ledger does not know about."),
+    ("Decisions waiting on the human", True,
+     "Numbered. Each: the question, the options, what it blocks, and how "
+     "decisions interact. Human-only: the successor must NOT decide these. "
+     "Write \"None.\" only if there truly are none."),
+    ("Next sequence", False,
+     "Ordered steps you would take next, with the WHY of the ordering "
+     "(what must land before what, what is human-owned)."),
+    ("Traps", True,
+     "The expensive things to re-learn: facts that look arbitrary in a diff, "
+     "gates that are not what they seem, branches gone stale, misleading "
+     "names. Concrete, with the evidence. \"None.\" if there are none."),
+    ("Process lessons", True,
+     "How the harness/human/executors actually behaved this run that the "
+     "successor should do differently or keep doing. \"None.\" if none."),
+    ("Read first", True,
+     "Durable documents worth reading, in order, each with WHY - backticked "
+     "reports/... paths (they are checked to exist). The full index is "
+     "generated below; this is your curated short list."),
+]
+NAMES = [s[0] for s in SECTIONS]
+TERMINAL = ("closed",)
+
+def load():
+    st, order = {}, []
+    try:
+        fh = open(ledger)
+    except OSError:
+        return st, order
+    for line in fh:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        tid = o.get("id")
+        if not tid:
+            continue
+        if tid not in st:
+            order.append(tid)
+            st[tid] = {"events": []}
+        st[tid]["events"].append(o)
+    out = {}
+    for tid in order:
+        evs = st[tid]["events"]
+        t = {"id": tid, "rec": {}, "status": "?", "created": None, "last_ts": None,
+             "note": None, "pr": None, "compare": None, "commit": None,
+             "exec_report": None, "report_file": None, "handoffs": 0,
+             "closed_ts": None, "last_event": None, "pane": None}
+        for o in evs:
+            ev = o.get("event")
+            if o.get("dispatch_pane"):
+                t["pane"] = o["dispatch_pane"]
+            if ev == "created" and t["created"] is None:
+                t["created"] = o.get("ts")
+            if ev in ("created", "handoff"):
+                t["rec"] = o
+                if ev == "handoff":
+                    t["handoffs"] += 1
+            if o.get("status"):
+                t["status"] = o["status"]
+                if o["status"] == "closed":
+                    t["closed_ts"] = o.get("ts")
+            if o.get("ts"):
+                t["last_ts"] = o.get("ts")
+            t["last_event"] = ev
+            if o.get("note") and ev in ("settled", "reported", "amended", "working", "reconciled"):
+                t["note"] = o["note"]
+            for k_src, k_dst in (("pr", "pr"), ("pr_url", "pr"), ("compare", "compare"),
+                                 ("commit", "commit"), ("executor_report", "exec_report"),
+                                 ("report_file", "report_file")):
+                if o.get(k_src):
+                    t[k_dst] = o[k_src]
+        out[tid] = t
+    return out, order
+
+def live_map(path):
+    m = {}
+    try:
+        for line in open(path):
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) == 2:
+                m[parts[0]] = parts[1]
+    except OSError:
+        pass
+    return m
+
+tasks, order = load()
+open_ids = [i for i in order if tasks[i]["status"] not in TERMINAL]
+
+if op == "open-ids":
+    for i in open_ids:
+        print(i)
+    sys.exit(0)
+
+live = live_map(sys.argv[3])
+
+def mode_tag(t):
+    r = t["rec"]
+    mode = r.get("mode") or "code"
+    if r.get("pr_number"):
+        return "code/autopilot"
+    if mode == "code":
+        return "code/scoped" if r.get("scoped") else "code/open-ended"
+    if mode == "brainstorm":
+        return "brainstorm (%s)" % (r.get("skills") or "?")
+    return mode
+
+def repos(t):
+    return ",".join(w.get("repo", "?") for w in (t["rec"].get("worktrees") or [])) \
+        or (t["rec"].get("primary_repo") or "-")
+
+def one_line(s, n):
+    s = " ".join((s or "").split())
+    return s if len(s) <= n else s[: n - 1] + "\u2026"
+
+if op == "template":
+    print("# Dispatch handoff \u2014 <<FILL: a short title naming the current focus>>")
+    print()
+    for name, may_none, guide in SECTIONS:
+        print("## %s" % name)
+        print()
+        print("<!-- %s -->" % guide)
+        print()
+        if name == "Task notes":
+            if open_ids:
+                for i in open_ids:
+                    print("- `%s` (%s, %s) \u2014 <<FILL>>" % (i, tasks[i]["status"], mode_tag(tasks[i])))
+            else:
+                print("<<FILL: no open tasks in the ledger \u2014 say what, if anything, is in flight outside it>>")
+        else:
+            print("<<FILL>>")
+        print()
+    sys.exit(0)
+
+# ---------------------------------------------------------------- compose ---
+root, reports, body_path, prev_display, generated = sys.argv[4:9]
+body = open(body_path).read()
+
+# 1. parse: optional H1 title, preamble, ## sections (comments stripped)
+clean = re.sub(r"<!--.*?-->", "", body, flags=re.S)
+title, pre, secs, sec_order, cur = None, [], {}, [], None
+for line in clean.splitlines():
+    m1 = re.match(r"^#\s+(.*\S)\s*$", line)
+    m2 = re.match(r"^##\s+(.*\S)\s*$", line)
+    if m1 and title is None and cur is None and not "".join(pre).strip():
+        title = m1.group(1)
+        continue
+    if m2:
+        cur = m2.group(1).strip()
+        key = cur.lower()
+        if key in secs:
+            secs[key]["lines"].append("")
+        else:
+            secs[key] = {"name": cur, "lines": []}
+            sec_order.append(key)
+        continue
+    if cur is None:
+        pre.append(line)
+    else:
+        secs[cur.lower()]["lines"].append(line)
+
+def text(key):
+    return "\n".join(secs[key]["lines"]).strip() if key in secs else ""
+
+errors = []
+BARE_NONE = {"none", "n/a", "na", "nothing", "-", "none yet", "nil"}
+def bare_none(s):
+    s = re.sub(r"^[\s*\-\u2022>]+", "", s.strip().lower()).strip(" .!")
+    return s in BARE_NONE
+
+for name, may_none, _ in SECTIONS:
+    key = name.lower()
+    if key not in secs:
+        errors.append("missing required section '## %s'" % name)
+        continue
+    s = text(key)
+    if not s:
+        errors.append("section '## %s' is empty" % name)
+    elif bare_none(s) and not may_none:
+        errors.append("section '## %s' cannot be a bare 'None' - say what is actually true" % name)
+
+whole = (title or "") + "\n" + clean
+if re.search(r"<<\s*FILL", whole):
+    errors.append("template <<FILL ...>> markers are still in the body")
+if title and re.search(r"<<|>>", title):
+    errors.append("the title still carries a template marker")
+for tok in ("TODO", "TBD", "FIXME", "XXX"):
+    if re.search(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % tok, whole):
+        errors.append("placeholder token %s left in the body" % tok)
+for ln in whole.splitlines():
+    if ln.strip() in ("...", "\u2026", "- ...", "- \u2026"):
+        errors.append("an ellipsis-only line stands in for content")
+        break
+
+notes = text("task notes")
+missing = [i for i in open_ids if i not in notes]
+if "task notes" in secs and missing:
+    errors.append("Task notes does not account for open task(s): " + ", ".join(missing))
+
+cited = sorted(set(m.rstrip(".,;:") for m in
+                   re.findall(r"reports/[A-Za-z0-9._/-]*[A-Za-z0-9_-]\.md", whole)))
+for c in cited:
+    if os.path.basename(c) == "DISPATCH-HANDOFF.md":
+        continue
+    if not os.path.exists(os.path.join(root, c)):
+        errors.append("cites %s, which does not exist" % c)
+
+if errors:
+    sys.stderr.write("dispatch-handoff: REFUSED - fix the body and re-run:\n")
+    for e in errors:
+        sys.stderr.write("  - %s\n" % e)
+    sys.exit(2)
+
+# 2. render
+def cell(s):
+    return (s or "-").replace("|", "\\|").replace("\n", " ")
+
+def report_files(tid):
+    try:
+        names = os.listdir(reports)
+    except OSError:
+        return []
+    pat = re.compile(r"^(\d{4}-\d{2}-\d{2}-)?%s(\.executor)?\.md$" % re.escape(tid))
+    return sorted("reports/" + n for n in names if pat.match(n))
+
+ACTION = {
+    "awaiting-dispatch": "SETTLED BUT NOT PERSISTED - read its executor report, then `bin/task-worktree report %(id)s`",
+    "awaiting-handoff": "CONTEXT-BUDGET HANDOFF pending - `bin/task-worktree handoff %(id)s --note-from <its executor report>`",
+    "paused-by-human": "the human STOPPED this executor - steer it or let it resume; not finished",
+    "blocked": "executor stopped BLOCKED - its note says on what",
+    "orphaned": "NO LIVE AGENT - the executor is gone; inspect the worktree before re-spawning",
+    "watcher-failed": "the backstop watcher FAILED - see .dispatch/logs/watch-%(id)s.log",
+    "wrapping-up": "brainstorm writing its plan - one wake will follow",
+    "in-conversation": "brainstorm dialogue the HUMAN drives (`herdr agent focus %(id)s`) - never steer or wrap it up yourself",
+}
+
+out = []
+w = out.append
+w("# %s" % (title or "Dispatch handoff"))
+w("")
+w("> Successor briefing for the next **Dispatch** session, generated %s by" % generated)
+w("> `bin/task-worktree dispatch-handoff`. The first half is the outgoing")
+w("> session's own judgement; the second half is a ledger snapshot taken at the")
+w("> same moment. Pick it up as AGENTS.md section \"Picking up a Dispatch handoff\"")
+w("> says. Where the snapshot and `bin/task-worktree list` disagree, the ledger is")
+w("> newer: trust it for STATUS, and this file for WHY.")
+w(">")
+w("> Previous handoff: %s" % prev_display)
+w("")
+pre_s = "\n".join(pre).strip()
+if pre_s:
+    w(pre_s)
+    w("")
+w("---")
+w("")
+canon = [n.lower() for n in NAMES]
+for key in canon + [k for k in sec_order if k not in canon]:
+    w("## %s" % secs[key]["name"] if key not in canon else "## %s" % NAMES[canon.index(key)])
+    w("")
+    w(text(key))
+    w("")
+w("---")
+w("")
+w("# Ledger snapshot (generated \u2014 regenerate, never hand-edit)")
+w("")
+w("Snapshot of `.dispatch/ledger.jsonl` + `reports/` + live herdr agent status at %s." % generated)
+w("")
+
+w("## Needs Dispatch action")
+w("")
+acts = []
+for i in open_ids:
+    s = tasks[i]["status"]
+    if s in ACTION:
+        acts.append((i, s, ACTION[s] % {"id": i}))
+    elif s == "working" and not live.get(i):
+        acts.append((i, s, "the ledger says working but herdr has NO live agent "
+                     "(a human-owned worktree, or a dead executor?) - "
+                     "`bin/task-worktree reconcile --dry-run` before assuming either"))
+if acts:
+    for i, s, a in acts:
+        w("- `%s` \u2014 **%s**: %s" % (i, s, a))
+else:
+    w("Nothing: no open task is in a state that needs Dispatch to act.")
+w("")
+
+# Wake routing: a settle wakes the pane recorded at create time (task.env
+# first, then the ledger - the same order _resolve_dispatch_pane uses), NOT
+# whichever pane Dispatch happens to live in now.
+def task_env_pane(tid):
+    try:
+        for line in open(os.path.join(root, "tasks", tid, "task.env")):
+            m = re.match(r'^TASK_DISPATCH_PANE="?([^"\n]*)"?', line)
+            if m and m.group(1):
+                return m.group(1)
+    except OSError:
+        pass
+    return None
+alive = None   # None = could not list panes; never guess a pane is dead
+try:
+    with open(os.environ.get("DH_PANES_FILE", "")) as fh:
+        alive = set(p_["pane_id"] for p_ in json.load(fh)["result"]["panes"])
+except Exception:
+    alive = None
+panes = {}
+for i in open_ids:
+    panes.setdefault(task_env_pane(i) or tasks[i]["pane"] or "(discovered live)", []).append(i)
+w("## Wake routing")
+w("")
+here = os.environ.get("HERDR_PANE_ID") or ""
+if here:
+    w("This handoff was written from herdr pane `%s`." % here)
+if panes:
+    for p_, ids in sorted(panes.items()):
+        dead = alive is not None and not p_.startswith("(") and p_ not in alive
+        w("- settles of %s wake pane `%s`%s" % (", ".join("`%s`" % i for i in ids), p_,
+          " \u2014 **THAT PANE NO LONGER EXISTS: these wakes are lost; watch `list` instead**" if dead else ""))
+    w("")
+    w("Wakes go to the pane recorded when each task was CREATED. Run the successor")
+    w("session in that same pane, or those wakes land nowhere useful (the ledger")
+    w("still records every settle; `bin/task-worktree list` shows them).")
+else:
+    w("No open tasks, so nothing will wake the successor until it spawns work.")
+w("")
+
+w("## Open tasks (%d)" % len(open_ids))
+w("")
+if open_ids:
+    w("| task | status | live agent | mode | tier | repos | branch | PR / compare |")
+    w("|---|---|---|---|---|---|---|---|")
+    for i in open_ids:
+        t = tasks[i]; r = t["rec"]
+        link = t["pr"] or t["compare"] or "-"
+        w("| `%s` | %s | %s | %s | %s | %s | %s | %s |" % (
+            i, cell(t["status"]), cell(live.get(i) or "no agent"), cell(mode_tag(t)),
+            cell(r.get("tier") or (r.get("model") or "-")), cell(repos(t)),
+            cell(r.get("branch")), cell(link)))
+    w("")
+    w("### Per-task detail")
+    w("")
+    for i in open_ids:
+        t = tasks[i]; r = t["rec"]
+        w("#### `%s`" % i)
+        w("")
+        w("- **status:** %s (last event `%s` at %s) \u00b7 **live agent:** %s" % (
+            t["status"], t["last_event"], t["last_ts"] or "?", live.get(i) or "no agent"))
+        w("- **created:** %s \u00b7 **executor handoffs:** %d \u00b7 **model:** %s" % (
+            t["created"] or "?", t["handoffs"], r.get("model") or "-"))
+        if t["pr"]:
+            w("- **PR:** %s" % t["pr"])
+        if t["compare"]:
+            w("- **compare:** %s" % t["compare"])
+        if t["commit"]:
+            w("- **last commit:** `%s`" % t["commit"])
+        rf = report_files(i)
+        if rf:
+            w("- **reports:** " + ", ".join("`%s`" % f for f in rf))
+        req = (r.get("request") or "").strip()
+        if req:
+            w("- **the human asked:** %s" % one_line(req, 600))
+        if t["note"]:
+            w("- **latest note:** %s" % one_line(t["note"], 600))
+        w("")
+else:
+    w("None.")
+    w("")
+
+w("## Recently closed")
+w("")
+closed = [i for i in order if tasks[i]["status"] == "closed"]
+closed.sort(key=lambda i: tasks[i]["closed_ts"] or "", reverse=True)
+if closed:
+    for i in closed[:10]:
+        t = tasks[i]
+        rf = [f for f in report_files(i) if not f.endswith(".executor.md")]
+        w("- `%s` \u2014 closed %s \u2014 %s \u2014 %s \u2014 %s" % (
+            i, t["closed_ts"] or "?", mode_tag(t), ("`%s`" % rf[0]) if rf else "no report",
+            one_line(t["rec"].get("request"), 110)))
+    if len(closed) > 10:
+        w("- \u2026 and %d older closed tasks (`bin/task-worktree list`)." % (len(closed) - 10))
+else:
+    w("None.")
+w("")
+
+w("## Reports index")
+w("")
+try:
+    names = sorted(os.listdir(reports))
+except OSError:
+    names = []
+hand = re.compile(r"^\d{4}-\d{2}-\d{2}-dispatch-handoff-\d{4}(-legacy)?\.md$")
+names = [n for n in names if n.endswith(".md") and n != "DISPATCH-HANDOFF.md" and not hand.match(n)]
+dated = sorted([n for n in names if re.match(r"^\d{4}-\d{2}-\d{2}-", n)], reverse=True)
+undated = [n for n in names if not re.match(r"^\d{4}-\d{2}-\d{2}-", n)]
+if undated:
+    w("Not tied to a task id (plans, state notes):")
+    w("")
+    for n in undated:
+        w("- `reports/%s`" % n)
+    w("")
+if dated:
+    w("Most recent task reports (%d of %d; `ls reports/` for all). `<id>.md` is" % (min(25, len(dated)), len(dated)))
+    w("Dispatch's persisted report, `<id>.executor.md` the executor's own words:")
+    w("")
+    for n in dated[:25]:
+        w("- `reports/%s`" % n)
+    w("")
+if not names:
+    w("No reports yet.")
+    w("")
+sys.stdout.write("\n".join(out).rstrip("\n") + "\n")
+PY
+}
+
+cmd_dispatch_handoff() {
+  local template=0 body_file="" dry=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --template)  template=1; shift ;;
+      --body-file) body_file="${2:-}"; shift 2 ;;
+      --dry-run)   dry=1; shift ;;
+      -h|--help)   usage_dispatch_handoff; return 0 ;;
+      *) usage_dispatch_handoff
+         case "$1" in
+           -*) die "dispatch-handoff: unknown arg '$1'" ;;
+           *)  die "dispatch-handoff: takes no task id - this hands off DISPATCH's own context. To replace a task's executor use 'handoff $1'." ;;
+         esac ;;
+    esac
+  done
+
+  # Live herdr snapshot for every open task (status only; nothing is touched).
+  local live; live="$(mktemp "${TMPDIR:-/tmp}/dh-live.XXXXXX")"
+  local tid st
+  while IFS= read -r tid; do
+    [ -n "$tid" ] || continue
+    st="$(_agent_status "$tid")"
+    printf '%s\t%s\n' "$tid" "${st:-}" >> "$live"
+  done <<< "$(_dh_py open-ids "$LEDGER")"
+
+  if [ "$template" -eq 1 ]; then
+    [ -z "$body_file" ] || { rm -f "$live"; die "dispatch-handoff: --template and --body-file are exclusive"; }
+    _dh_py template "$LEDGER" "$live"
+    rm -f "$live"
+    return 0
+  fi
+  if [ -z "$body_file" ]; then
+    rm -f "$live"; usage_dispatch_handoff
+    die "dispatch-handoff: --body-file required (start from --template)"
+  fi
+  [ -f "$body_file" ] || { rm -f "$live"; die "dispatch-handoff: --body-file not found: $body_file"; }
+
+  mkdir -p "$REPORTS_DIR"
+  local name; name="$(date +%Y-%m-%d)-dispatch-handoff-$(date +%H%M).md"
+  local pointer="$REPORTS_DIR/$DH_POINTER_NAME"
+
+  # A hand-written regular file at the pointer path predates this verb: it is
+  # ARCHIVED under a dated name (from its own mtime), never overwritten.
+  local legacy_name=""
+  if [ -f "$pointer" ] && [ ! -L "$pointer" ]; then
+    legacy_name="$(python3 -c 'import os,sys,time;t=time.localtime(os.path.getmtime(sys.argv[1]));print(time.strftime("%Y-%m-%d-dispatch-handoff-%H%M",t))' "$pointer")"
+    if [ -e "$REPORTS_DIR/$legacy_name.md" ] || [ "$legacy_name.md" = "$name" ]; then
+      legacy_name="$legacy_name-legacy"
+    fi
+    legacy_name="$legacy_name.md"
+  fi
+
+  # Previous handoff: what the pointer points at RIGHT NOW (that is what the
+  # last successor was told to read); else the archived hand-written file;
+  # else the newest dated handoff other than the one being written.
+  local prev="" prev_display="none (this is the first generated handoff)"
+  if [ -L "$pointer" ] && [ -f "$pointer" ] && [ "$(readlink "$pointer")" != "$name" ]; then
+    prev="$(basename "$(readlink "$pointer")")"
+  elif [ -n "$legacy_name" ]; then
+    prev="$legacy_name"
+  else
+    prev="$(ls "$REPORTS_DIR" 2>/dev/null \
+      | grep -E '^[0-9]{4}-[0-9]{2}-[0-9]{2}-dispatch-handoff-[0-9]{4}(-legacy)?\.md$' \
+      | grep -vx "$name" | sort | tail -1 || true)"
+  fi
+  if [ -n "$prev" ]; then
+    prev_display="\`reports/$prev\`"
+    if [ -n "$legacy_name" ] && [ "$dry" -eq 1 ]; then
+      prev_display="\`reports/$DH_POINTER_NAME\` (hand-written; archived as \`reports/$legacy_name\` on a real run)"
+    fi
+  fi
+
+  local out; out="$(mktemp "${TMPDIR:-/tmp}/dh-out.XXXXXX")"
+  local panes_file; panes_file="$(mktemp "${TMPDIR:-/tmp}/dh-panes.XXXXXX")"
+  herdr pane list > "$panes_file" 2>/dev/null || : > "$panes_file"
+  local rc=0
+  DH_PANES_FILE="$panes_file" _dh_py compose "$LEDGER" "$live" "$ROOT" "$REPORTS_DIR" "$body_file" "$prev_display" \
+    "$(date '+%Y-%m-%d %H:%M %Z')" > "$out" || rc=$?
+  rm -f "$live" "$panes_file"
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$out"
+    return 2
+  fi
+
+  if [ "$dry" -eq 1 ]; then
+    cat "$out"; rm -f "$out"
+    info "dispatch-handoff: dry run - body accepted, nothing written"
+    return 0
+  fi
+
+  if [ -n "$legacy_name" ]; then
+    mv "$pointer" "$REPORTS_DIR/$legacy_name"
+    info "archived the hand-written $DH_POINTER_NAME as reports/$legacy_name"
+  fi
+  # cat, not mv: the mktemp file is 0600; the report should get the umask mode
+  # every other report gets.
+  cat "$out" > "$REPORTS_DIR/$name"; rm -f "$out"
+  ln -sfn "$name" "$pointer"
+  info "dispatch handoff written: reports/$name (reports/$DH_POINTER_NAME points at it)"
+  info "open the new Dispatch session with:  Read reports/$DH_POINTER_NAME - that's your state."
+  printf '%s\n' "reports/$name"
+}
+
+# ---------------------------------------------------------------------------
 # prune
 # ---------------------------------------------------------------------------
 # Remove dangling worktree-view symlinks (target gone) and unused repo symlinks.
@@ -3172,7 +3800,7 @@ usage() {
   cat >&2 <<EOF
 task-worktree — blessed path for agentic tasks in this Dispatch root
 
-Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|context-check|reconcile|repair-models|remove|prune|list|models|help> [args]
+Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|context-check|reconcile|repair-models|remove|prune|list|models|dispatch-handoff|help> [args]
 
   create    Spin a task: worktree(s) + ephemeral task dir + executor agent.
             --mode code | investigate | brainstorm (brainstorm needs --skill).
@@ -3198,6 +3826,12 @@ Usage: task-worktree <create|autopilot|handoff|wrapup|done|report|classify|conte
   list      Show task status from the ledger.
   models    Show the model registry: tiers, mode->tier, what each resolves to.
 
+  dispatch-handoff  DISPATCH hands off ITS OWN context to a fresh Dispatch
+            session: --template, then --body-file. Writes the successor
+            briefing (your judgement + a generated ledger snapshot) to
+            reports/ and points reports/DISPATCH-HANDOFF.md at it. Not
+            'handoff <id>', which swaps a task's executor.
+
 Run 'task-worktree <cmd> --help' for details.
 EOF
 }
@@ -3220,6 +3854,7 @@ main() {
     classify) cmd_classify "$@" ;;
     context-check) cmd_context_check "$@" ;;
     reconcile) cmd_reconcile "$@" ;;
+    dispatch-handoff) cmd_dispatch_handoff "$@" ;;
     repair-models) cmd_repair_models "$@" ;;
     remove) cmd_remove "$@" ;;
     prune)  cmd_prune "$@" ;;

@@ -194,6 +194,14 @@ workspace)
     printf '{"result":{"workspace":{"workspace_id":"ws-exec"},"root_pane":{"pane_id":"wX:p9"}}}\n' ;;
   *) echo '{"result":{}}' ;;
   esac ;;
+pane)
+  # `pane list` is only answered when a case opts in with HERDR_STUB_PANES
+  # (space-separated pane ids); otherwise it is the generic empty result.
+  if [ "${2:-}" = list ] && [ -n "${HERDR_STUB_PANES:-}" ]; then
+    printf '{"result":{"panes":['; sep=""
+    for p in $HERDR_STUB_PANES; do printf '%s{"pane_id":"%s"}' "$sep" "$p"; sep=","; done
+    printf ']}}\n'
+  else echo '{"result":{}}'; fi ;;
 notification) printf 'NOTIFY\t%s\n' "$*" >> "$LOG"; echo '{"result":{}}' ;;
 *) echo '{"result":{}}' ;;
 esac
@@ -1987,12 +1995,166 @@ case "$(TW models 2>&1)" in *--scoped*) ok "'models' explains that scopedness is
   *) bad "'models' explains that scopedness is never inferred" "$(TW models 2>&1)" ;; esac
 }
 
+# ===========================================================================
+sect_32() {
+section "32. dispatch-handoff: Dispatch hands off ITS OWN context"
+# NOT 'handoff <id>' (which swaps a task's executor). The verb composes the
+# successor briefing from Dispatch's judgement (a body it must fill) plus a
+# ledger snapshot it generates itself, and REFUSES a body that skimps.
+OPEN1="open-code-a1a"; OPEN2="open-paused-b2b"; GONE="manual-wt-c3c"; SHUT="closed-d4d"
+dh_ledger() {
+  {
+    printf '%s\n' "{\"event\":\"created\",\"id\":\"$SHUT\",\"branch\":\"$SHUT\",\"primary_repo\":\"widget\",\"mode\":\"investigate\",\"request\":\"find the thing\",\"status\":\"working\",\"ts\":\"2025-01-01T10:00:00Z\"}"
+    printf '%s\n' "{\"event\":\"closed\",\"id\":\"$SHUT\",\"status\":\"closed\",\"ts\":\"2025-01-02T10:00:00Z\"}"
+    printf '%s\n' "{\"event\":\"created\",\"id\":\"$OPEN1\",\"branch\":\"$OPEN1\",\"primary_repo\":\"widget\",\"mode\":\"code\",\"tier\":\"deep\",\"request\":\"make the widget spin\",\"dispatch_pane\":\"wDISPATCH:p1\",\"compare\":\"https://github.com/acme/widget/compare/main...$OPEN1\",\"status\":\"working\",\"ts\":\"2025-01-03T10:00:00Z\"}"
+    printf '%s\n' "{\"event\":\"settled\",\"id\":\"$OPEN1\",\"status\":\"awaiting-dispatch\",\"by\":\"executor\",\"note\":\"spins now\",\"pr\":\"https://github.com/acme/widget/pull/77\",\"commit\":\"abc1234\",\"ts\":\"2025-01-03T11:00:00Z\"}"
+    printf '%s\n' "{\"event\":\"reported\",\"id\":\"$OPEN1\",\"status\":\"awaiting-review\",\"note\":\"spins now, PR 77\",\"report_file\":\"reports/2025-01-03-$OPEN1.md\",\"ts\":\"2025-01-03T11:05:00Z\"}"
+    printf '%s\n' "{\"event\":\"created\",\"id\":\"$OPEN2\",\"branch\":\"$OPEN2\",\"primary_repo\":\"widget\",\"mode\":\"code\",\"scoped\":true,\"tier\":\"standard\",\"request\":\"rename a thing\",\"dispatch_pane\":\"wOLD:p1\",\"status\":\"working\",\"ts\":\"2025-01-04T10:00:00Z\"}"
+    printf '%s\n' "{\"event\":\"paused\",\"id\":\"$OPEN2\",\"status\":\"paused-by-human\",\"ts\":\"2025-01-04T11:00:00Z\"}"
+    printf '%s\n' "{\"event\":\"created\",\"id\":\"$GONE\",\"branch\":\"$GONE\",\"primary_repo\":\"widget\",\"mode\":\"code\",\"request\":\"a worktree for me\",\"status\":\"working\",\"ts\":\"2025-01-05T10:00:00Z\"}"
+  } > "$SANDBOX/.dispatch/ledger.jsonl"
+  mkdir -p "$SANDBOX/reports"
+  printf 'r\n' > "$SANDBOX/reports/2025-01-03-$OPEN1.md"
+  printf 'r\n' > "$SANDBOX/reports/2025-01-01-$SHUT.md"
+  state "$OPEN1" idle; state "$OPEN2" idle    # $GONE has no live agent
+}
+# dh_body [<section-to-drop>] — a well-formed judgement body
+dh_body() {
+  local f="$SANDBOX/dh-body.md" drop="${1:-}"
+  {
+    printf '# Dispatch handoff - widget spinning\n\n'
+    [ "$drop" = "State" ] || printf '## State\n\nThe widget spins on PR 77; one rename is paused.\n\n'
+    [ "$drop" = "Task notes" ] || printf '## Task notes\n\n- `%s` is the real work.\n- `%s` was stopped by the human mid-rename.\n- `%s` is the human own scratch worktree.\n\n' "$OPEN1" "$OPEN2" "$GONE"
+    [ "$drop" = "Decisions waiting on the human" ] || printf '## Decisions waiting on the human\n\n1. Spin clockwise or not.\n\n'
+    [ "$drop" = "Next sequence" ] || printf '## Next sequence\n\n1. Land PR 77, then resume the rename on top of it.\n\n'
+    [ "$drop" = "Traps" ] || printf '## Traps\n\nNone.\n\n'
+    [ "$drop" = "Process lessons" ] || printf '## Process lessons\n\n- A paused task is not a finished one.\n\n'
+    [ "$drop" = "Read first" ] || printf '## Read first\n\n- `reports/2025-01-03-%s.md` - why it spins.\n' "$OPEN1"
+  } > "$f"
+  printf '%s' "$f"
+}
+dh_files() { ls "$SANDBOX/reports" 2>/dev/null | grep -cE '^[0-9]{4}-[0-9]{2}-[0-9]{2}-dispatch-handoff-[0-9]{4}(-legacy)?\.md$' | tr -d ' '; }
+SECTS="State|Task notes|Decisions waiting on the human|Next sequence|Traps|Process lessons|Read first"
+
+# ---- --template: every required section, every OPEN task pre-listed -------
+setup; dh_ledger
+tpl="$(TW dispatch-handoff --template 2>/dev/null)"
+miss=""; IFS='|'; for s in $SECTS; do case "$tpl" in *"## $s"*) ;; *) miss="$miss[$s]" ;; esac; done; unset IFS
+is "--template prints every required section" "${miss:-none}" "none"
+case "$tpl" in *"\`$OPEN1\`"*"\`$OPEN2\`"*"\`$GONE\`"*) ok "--template pre-lists every open task id under Task notes" ;;
+  *) bad "--template pre-lists every open task id under Task notes" "$tpl" ;; esac
+case "$tpl" in *"$SHUT"*) bad "--template leaves closed tasks out" ;; *) ok "--template leaves closed tasks out" ;; esac
+is "--template writes nothing" "$(dh_files)" "0"
+printf '%s\n' "$tpl" > "$SANDBOX/tpl.md"
+TW dispatch-handoff --body-file "$SANDBOX/tpl.md" >/dev/null 2>&1; rc=$?
+is "an UNFILLED template is refused" "$rc" "2"
+
+# ---- the refusals ----------------------------------------------------------
+setup; dh_ledger; L0="$(ledger)"
+err="$(TW dispatch-handoff --body-file "$(dh_body Traps)" 2>&1 >/dev/null)"; rc=$?
+is "a body missing a required section is refused (rc 2)" "$rc" "2"
+case "$err" in *"missing required section '## Traps'"*) ok "and the refusal names the section" ;;
+  *) bad "and the refusal names the section" "$err" ;; esac
+f="$(dh_body)"; sed -i.bak "/is the human own scratch/d" "$f"
+err="$(TW dispatch-handoff --body-file "$f" 2>&1 >/dev/null)"; rc=$?
+is "a body that forgets an OPEN task is refused" "$rc" "2"
+case "$err" in *"$GONE"*) ok "and the refusal names the forgotten task" ;; *) bad "and the refusal names the forgotten task" "$err" ;; esac
+f="$(dh_body)"; printf '\n- TODO: write the rest\n' >> "$f"
+TW dispatch-handoff --body-file "$f" >/dev/null 2>&1; rc=$?
+is "a TODO left in the body is refused" "$rc" "2"
+f="$(dh_body)"; sed -i.bak 's/^The widget spins.*$/None./' "$f"
+err="$(TW dispatch-handoff --body-file "$f" 2>&1 >/dev/null)"; rc=$?
+is "a bare 'None' State is refused" "$rc" "2"
+f="$(dh_body)"; printf -- '- `reports/2099-01-01-imaginary-zzz.md` - made up\n' >> "$f"
+err="$(TW dispatch-handoff --body-file "$f" 2>&1 >/dev/null)"; rc=$?
+is "citing a reports/ file that does not exist is refused" "$rc" "2"
+case "$err" in *imaginary-zzz*) ok "and the refusal names the bad citation" ;; *) bad "and the refusal names the bad citation" "$err" ;; esac
+is "a refusal writes no handoff file" "$(dh_files)" "0"
+if [ -e "$SANDBOX/reports/DISPATCH-HANDOFF.md" ]; then bad "a refusal creates no pointer"; else ok "a refusal creates no pointer"; fi
+err="$(TW dispatch-handoff "$OPEN1" 2>&1)"; rc=$?
+if [ "$rc" -ne 0 ]; then case "$err" in *"handoff $OPEN1"*) ok "a task id is refused, pointing at 'handoff <id>'" ;;
+  *) bad "a task id is refused, pointing at 'handoff <id>'" "$err" ;; esac
+else bad "a task id is refused, pointing at 'handoff <id>'" "rc 0"; fi
+
+# ---- --dry-run --------------------------------------------------------------
+out="$(TW dispatch-handoff --body-file "$(dh_body)" --dry-run 2>/dev/null)"; rc=$?
+is "--dry-run accepts a good body" "$rc" "0"
+case "$out" in *"# Ledger snapshot"*) ok "--dry-run prints the composed document" ;; *) bad "--dry-run prints the composed document" "$out" ;; esac
+is "--dry-run writes nothing" "$(dh_files)" "0"
+
+# ---- a good body: the document, the pointer, the mechanical half ------------
+legacy="$SANDBOX/reports/DISPATCH-HANDOFF.md"
+printf 'HAND WRITTEN %s\n' "$RANDOM" > "$legacy"; LEG="$(cat "$legacy")"
+out="$(TW dispatch-handoff --body-file "$(dh_body)" 2>/dev/null)"; rc=$?
+is "a good body is accepted (rc 0)" "$rc" "0"
+case "$out" in reports/????-??-??-dispatch-handoff-????.md) ok "stdout is the dated path ($out)" ;;
+  *) bad "stdout is the dated path" "$out" ;; esac
+doc="$SANDBOX/$out"
+if [ -L "$legacy" ] && [ "$(readlink "$legacy")" = "$(basename "$out")" ]; then
+  ok "reports/DISPATCH-HANDOFF.md now points at it"
+else bad "reports/DISPATCH-HANDOFF.md now points at it" "$(ls -l "$SANDBOX/reports")"; fi
+arch="$(grep -lx "$LEG" "$SANDBOX"/reports/*-dispatch-handoff-*.md 2>/dev/null | head -1)"
+if [ -n "$arch" ]; then ok "the hand-written pointer file was ARCHIVED, byte-for-byte"
+else bad "the hand-written pointer file was ARCHIVED, byte-for-byte" "$(ls "$SANDBOX/reports")"; fi
+case "$(cat "$doc")" in *"Previous handoff: \`reports/$(basename "$arch")\`"*) ok "and the new doc names it as the previous handoff" ;;
+  *) bad "and the new doc names it as the previous handoff" "$(grep Previous "$doc")" ;; esac
+if [ "$(ledger)" = "$L0" ]; then ok "the ledger is untouched (read-only on task state)"; else bad "the ledger is untouched (read-only on task state)"; fi
+is "herdr saw no mutation (no prompt, start, stop or notify)" "$(wc -l < "$HERDR_STUB_LOG" | tr -d ' ')" "0"
+D="$(cat "$doc")"
+case "$D" in *"The widget spins on PR 77"*"Land PR 77"*) ok "the judgement half is carried through" ;; *) bad "the judgement half is carried through" ;; esac
+snap="${D#*# Ledger snapshot}"
+case "$snap" in *"| \`$OPEN1\` | awaiting-review | idle |"*) ok "snapshot: open task row with status + live agent" ;;
+  *) bad "snapshot: open task row with status + live agent" "$snap" ;; esac
+case "$snap" in *"https://github.com/acme/widget/pull/77"*) ok "snapshot: the PR link" ;; *) bad "snapshot: the PR link" ;; esac
+case "$snap" in *"make the widget spin"*) ok "snapshot: the human's original request" ;; *) bad "snapshot: the human's original request" ;; esac
+case "$snap" in *"reports/2025-01-03-$OPEN1.md"*) ok "snapshot: the task's report file" ;; *) bad "snapshot: the task's report file" ;; esac
+needs="$(printf '%s\n' "$snap" | sed -n '/^## Needs Dispatch action/,/^## Wake routing/p')"
+case "$needs" in *"$OPEN2"*paused-by-human*) ok "needs-action flags the human-paused task" ;; *) bad "needs-action flags the human-paused task" "$needs" ;; esac
+case "$needs" in *"$GONE"*"NO live agent"*) ok "needs-action flags 'working' with no live agent" ;; *) bad "needs-action flags 'working' with no live agent" "$needs" ;; esac
+case "$needs" in *"$OPEN1"*) bad "needs-action leaves a task awaiting review alone" ;; *) ok "needs-action leaves a task awaiting review alone" ;; esac
+opentab="$(printf '%s\n' "$snap" | sed -n '/^## Open tasks/,/^## Recently closed/p')"
+case "$opentab" in *"$SHUT"*) bad "a closed task is not listed as open" ;; *) ok "a closed task is not listed as open" ;; esac
+case "$(printf '%s\n' "$snap" | sed -n '/^## Recently closed/,$p')" in *"$SHUT"*) ok "but it is under Recently closed" ;; *) bad "but it is under Recently closed" ;; esac
+
+# ---- wake routing: a dead Dispatch pane is flagged, never guessed ----------
+wr() { printf '%s\n' "$1" | sed -n '/^## Wake routing/,/^## Open tasks/p'; }
+r="$(wr "$snap")"
+case "$r" in *"$OPEN1"*"wDISPATCH:p1"*) ok "wake routing names the pane each open task wakes" ;;
+  *) bad "wake routing names the pane each open task wakes" "$r" ;; esac
+case "$r" in *"NO LONGER EXISTS"*) bad "with no pane listing, no pane is declared dead" "$r" ;;
+  *) ok "with no pane listing, no pane is declared dead" ;; esac
+r="$(wr "$(HERDR_STUB_PANES="wDISPATCH:p1 wX:p9" TW dispatch-handoff --body-file "$(dh_body)" --dry-run 2>/dev/null)")"
+case "$r" in *"wOLD:p1"*"NO LONGER EXISTS"*) ok "a wake pane that no longer exists is flagged" ;;
+  *) bad "a wake pane that no longer exists is flagged" "$r" ;; esac
+case "$(printf '%s\n' "$r" | grep 'wDISPATCH:p1')" in *"NO LONGER EXISTS"*) bad "a live wake pane is not flagged" "$r" ;;
+  *) ok "a live wake pane is not flagged" ;; esac
+
+# ---- a second handoff chains to the first ------------------------------------
+first="$(basename "$out")"
+mv "$doc" "$SANDBOX/reports/2000-01-01-dispatch-handoff-0000.md"   # make it "older"
+ln -sfn 2000-01-01-dispatch-handoff-0000.md "$legacy"
+out2="$(TW dispatch-handoff --body-file "$(dh_body)" 2>/dev/null)"
+case "$(cat "$SANDBOX/$out2")" in *"Previous handoff: \`reports/2000-01-01-dispatch-handoff-0000.md\`"*) ok "a second handoff names the first as previous" ;;
+  *) bad "a second handoff names the first as previous" "$(grep Previous "$SANDBOX/$out2")" ;; esac
+is "the pointer moves to the newest" "$(readlink "$legacy")" "$(basename "$out2")"
+
+# ---- discoverability + no drift between the verb and Dispatch's contract -----
+h="$(TW dispatch-handoff --help 2>&1)"
+case "$h" in *"handoff <task-id>"*) ok "--help distinguishes it from 'handoff <task-id>'" ;; *) bad "--help distinguishes it from 'handoff <task-id>'" ;; esac
+case "$(TW help 2>&1)" in *dispatch-handoff*) ok "the top-level usage lists dispatch-handoff" ;; *) bad "the top-level usage lists dispatch-handoff" ;; esac
+agents="$(cat "$(dirname "$SRC")/../AGENTS.md" 2>/dev/null)"
+miss=""; IFS='|'; for s in $SECTS; do case "$agents" in *"$s"*) ;; *) miss="$miss[$s]" ;; esac; done; unset IFS
+is "AGENTS.md names every section the verb requires" "${miss:-none}" "none"
+case "$agents" in *"dispatch-handoff"*"DISPATCH-HANDOFF.md"*) ok "AGENTS.md documents the verb and the pointer" ;;
+  *) bad "AGENTS.md documents the verb and the pointer" ;; esac
+}
+
 # Longest sections FIRST: with bounded concurrency the makespan is dominated by
 # whatever starts last, so the live-watcher cases (the only ones that dwell) go
 # out of the gate first and the cheap ones backfill around them.
 # TASK_SELFTEST_SECTIONS narrows a run to named sections while debugging one;
 # unset (the default, and the gate) is every section.
-SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 30 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 29 31 24 0}"
+SECTION_ORDER="${TASK_SELFTEST_SECTIONS:-5 16 18 22 8 20 6 17 23 15 30 7 9 11 2 19 12 3 1 14 4 10 13 21 25 26 27 28 29 31 32 24 0}"
 
 # ---------------------------------------------------------------------------
 # the runner
