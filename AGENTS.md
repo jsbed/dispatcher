@@ -60,6 +60,7 @@ Everything goes through `bin/task-worktree <verb>`. Nothing here blocks except
 | `reconcile [id]` | you | repair ledger status from live herdr state (`--dry-run`, `--no-wake`). |
 | `report <id>` | you | persist the executor's report durably; auto-closes `investigate` and `brainstorm` tasks. |
 | `remove <id>` | you | teardown (`--delete-branch` optional). Explicit command only. |
+| `dispatch-handoff` | you, **on the human's word** | hand off **your own** context to a fresh Dispatch session (see below). Not `handoff <id>`. |
 | `prune` | you | drop dangling symlinks. |
 | `classify <id>` | you (debug) | *why* an agent is idle: `human-interrupt` / `completed` / `agent-error` / `unknown`. |
 | `context-check <id>` | you (debug) | is that task's executor over its context/turn handoff budget right now? |
@@ -292,6 +293,8 @@ tasks/<id>/                 ephemeral, symlink-only executor workspace
 .dispatch/brainstorm.skill-*.md     per-skill guidance composed into that frame
 reports/YYYY-MM-DD-<id>.md  the durable report/plan (survives teardown)
 reports/YYYY-MM-DD-<id>.executor.md   the executor's own words
+reports/YYYY-MM-DD-dispatch-handoff-HHMM.md  a Dispatch successor briefing
+reports/DISPATCH-HANDOFF.md -> the latest one (the only path a successor is told)
 bin/task-worktree           this blessed script
 bin/migrate-report-filenames  one-off: renames pre-dating reports into the scheme
 ```
@@ -416,6 +419,77 @@ bin/migrate-report-filenames  one-off: renames pre-dating reports into the schem
     fresh executor gets the departing one's own HANDOFF.md words). The task
     stays `working` afterwards, same as any other handoff; no `report`, no
     teardown, nothing else to do.
+
+## Handing off YOUR OWN context: "handoff the dispatcher context"
+
+When the human asks you to hand off **your** context — "handoff the dispatcher
+context", "hand off your context", "write your handoff", "I'm starting a fresh
+Dispatch" — you write the briefing a brand-new Dispatch session needs to carry
+on. This is **your** baton pass. It has nothing to do with `handoff <id>`, which
+swaps a task's *executor*; a request that names a task id means that verb.
+
+Your successor gets the ledger, `reports/` and this briefing, nothing else. The
+verb generates everything the ledger knows. The rest — what is pending on the
+human, the traps, why the next steps go in that order, what this run taught you
+— exists **only in your context** and dies with it. Writing it down is the job.
+
+**Do it start to finish without a single question to the human.** You already
+know everything this needs. A question here means the human does the handoff
+for you, which is exactly what this exists to stop. Where you genuinely don't
+know something, write down what is unknown and how to find out. That counts as
+information, not a gap.
+
+1. `bin/task-worktree dispatch-handoff --template > "$TMPDIR/dispatch-handoff.md"`
+   gives you the skeleton, with every open task id already listed.
+2. Fill every section from your own context. Write **only** what the successor
+   could not get from `list` or the generated snapshot (it already has statuses,
+   branches, PRs, requests and notes):
+   - **State**: one paragraph covering what we are doing, where it stands, and what blocks it.
+   - **Task notes**: every open task, saying what it *really* is: live, stale,
+     dead or salvageable, who is talking to it, what it waits on. Also anything
+     in flight that the ledger doesn't know about.
+   - **Decisions waiting on the human**: numbered, each with its options, what
+     it blocks and how the decisions interact. The successor never makes these.
+   - **Next sequence**: ordered, with the *why* of the order.
+   - **Traps**: the expensive things to re-learn, concrete and with evidence.
+   - **Process lessons**: how this run actually behaved, and what to repeat or
+     avoid.
+   - **Read first**: the few durable documents worth reading, each with *why*.
+   Write "None." only where the template allows it, and only when it is true.
+   Every sentence carries a fact, a reason or a warning; leave filler out.
+3. `bin/task-worktree dispatch-handoff --body-file "$TMPDIR/dispatch-handoff.md"`.
+   It refuses (rc 2, nothing written) a body that skips a section, leaves a
+   marker or TODO behind, forgets an open task, or cites a `reports/` file that
+   isn't there. Fix what it names and re-run. Do not pad your way past it.
+4. Give the human the printed path and the opening line for the new session:
+   **`Read reports/DISPATCH-HANDOFF.md — that's your state.`** If the snapshot's
+   *Wake routing* flags a pane that no longer exists, say so too: those tasks'
+   settles will not wake anyone.
+
+A handoff changes **no task state**. Nothing is stopped, closed, steered or
+reported, and executors keep running. Each task's settle still wakes the pane
+recorded when it was created. So the new session belongs **in the same herdr
+pane** (start a fresh pi session there), and the handoff's *Wake routing*
+section names those panes.
+
+### Picking up a Dispatch handoff
+
+You are the successor when the human opens with "read the handoff", "that's
+your state", "pick up where Dispatch left off", or hands you
+`reports/DISPATCH-HANDOFF.md`. Get caught up without questions:
+
+1. Read `reports/DISPATCH-HANDOFF.md` in full, then the documents under its
+   *Read first*.
+2. Run `bin/task-worktree list` and `bin/task-worktree reconcile --dry-run`.
+   The briefing is a snapshot. Wherever the ledger now says something else,
+   **the ledger wins on status**, and the briefing still explains *why*.
+3. Reply to the human in a few lines. Give what changed since the snapshot,
+   what needs Dispatch's action now, the decisions waiting on them, and the
+   next step you propose. Then wait for their go.
+
+The briefing's *Decisions waiting on the human* stay the human's. Its *Next
+sequence* is a recommendation, so start none of it until the human says so.
+Its *Traps* and *Process lessons* bind you as if you had learned them yourself.
 
 ## Opening a PR — always with auto-merge armed
 

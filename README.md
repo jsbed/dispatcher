@@ -37,6 +37,7 @@ bin/task-worktree reconcile  # repair ledger status from live herdr state
 bin/task-worktree classify   # why is an executor idle? (stopped by you / done / crashed)
 bin/task-worktree remove     # close a task and clean up (keeps the branch)
 bin/task-worktree prune      # reconcile dangling symlinks
+bin/task-worktree dispatch-handoff  # Dispatch hands off ITS OWN context to a fresh session
 ```
 
 Three kinds of task:
@@ -115,6 +116,36 @@ ledger lineage (`created → handoff`) all carry across.
 
 Every task starts from the freshly-fetched latest `main` tip unless you say
 otherwise.
+
+### Handing off Dispatch itself
+
+That was an *executor* baton pass. Dispatch has a context too, and when it is
+spent you start a fresh Dispatch session. Say **"handoff the dispatcher
+context"** and Dispatch writes the successor's briefing without asking you
+anything:
+
+```
+bin/task-worktree dispatch-handoff --template            # skeleton, open tasks pre-listed
+bin/task-worktree dispatch-handoff --body-file <filled>  # validate + compose + write
+```
+
+The briefing has two halves. **Judgement** is the part that lives only in the
+outgoing session's head: the state in a paragraph, notes on every open task,
+decisions waiting on you, the next sequence and why, traps, process lessons, and
+what to read first. Dispatch writes that. The verb **refuses** a body that skips
+a section, leaves a TODO or template marker, forgets an open task, or cites a
+report that doesn't exist. The **snapshot** is generated from the ledger, so
+nobody hand-assembles it. It covers open tasks (status, live agent, mode, tier,
+branch, PR/compare, your original request, the latest note), what needs
+Dispatch's action, which pane each task's settle wakes, recently closed work,
+and the reports index.
+
+It lands at `reports/<YYYY-MM-DD>-dispatch-handoff-<HHMM>.md`, and
+`reports/DISPATCH-HANDOFF.md` is re-pointed at it. Open the new session with
+*"Read reports/DISPATCH-HANDOFF.md, that's your state"* and it catches up by
+itself. Like every report it is workspace state, so it is gitignored. No task is
+touched. Start the new session in the **same herdr pane**, because each task
+wakes the pane recorded when it was created.
 
 ### Autopilot an existing PR
 
