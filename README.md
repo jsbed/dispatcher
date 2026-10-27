@@ -87,7 +87,7 @@ bin/task-worktree models                                  # view/verify, changes
 bin/task-worktree create --slug x --repo core              # open-ended code -> deep
 bin/task-worktree create --slug x --repo core --scoped     # asserted small/planned -> standard
 bin/task-worktree create --slug x --repo core --tier fast
-bin/task-worktree create --slug x --repo core --model anthropic/claude-opus-5
+bin/task-worktree create --slug x --repo core --model anthropic/claude-opus-5-5
 ```
 
 The resolved model and tier land in `tasks/<id>/task.env` and the `created`
@@ -166,21 +166,27 @@ or call `herdr`.
 
 ### Opening a PR
 
-Ask Dispatch to open a PR and it **always arms auto-merge**, because `gh pr
-create` has no flag for it:
+Ask Dispatch to open a PR and it opens exactly that — **auto-merge is left off**,
+GitHub's own default:
 
 ```
 gh pr create --repo <owner/repo> --base main --head <branch> --title "..." --body "..."
+```
+
+The merge stays yours. Dispatch arms auto-merge **only if you ask for it**
+("auto-merge this"), and then it is a second command:
+
+```
 gh pr merge <N> --repo <owner/repo> --auto --squash
 ```
 
-Auto-merge is not a bypass: GitHub still holds the PR until its own rules pass.
-On `Femtum/core` that means **1 approving review plus `Validate All / Success
-Gate`**. You approve, and it merges itself — no coming back to click a button.
+Even then it is not a bypass: GitHub still holds the PR until its own rules
+pass. On `Femtum/core` that means **1 approving review plus `Validate All /
+Success Gate`**.
 
-Auto-merge must be enabled on the repo (`allow_auto_merge`). It is on for
-`Femtum/core`; **off** for `Femtum/vision-lib` and `jsbed/dispatcher`, where
-Dispatch will tell you rather than quietly open an unarmed PR.
+Arming it needs `allow_auto_merge` on the repo. It is on for `Femtum/core`;
+**off** for `Femtum/vision-lib` and `jsbed/dispatcher`, where Dispatch tells you
+rather than failing quietly.
 
 Executors never touch merge state — no merging, no auto-merge, no marking ready,
 autopilot included. That lives with Dispatch on purpose.

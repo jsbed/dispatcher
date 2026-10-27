@@ -498,29 +498,33 @@ The briefing's *Decisions waiting on the human* stay the human's. Its *Next
 sequence* is a recommendation, so start none of it until the human says so.
 Its *Traps* and *Process lessons* bind you as if you had learned them yourself.
 
-## Opening a PR — always with auto-merge armed
+## Opening a PR — auto-merge OFF unless the human asks
 
-When the human asks **you** to open a PR, auto-merge is **not optional and not a
-question**. `gh pr create` has no auto-merge flag, so it is always two commands:
+When the human asks **you** to open a PR, it is **one command**, and the PR is
+left at GitHub's own default: **auto-merge not enabled**.
 
 ```
 gh pr create --repo <owner/repo> --base main --head <branch> \
   --title "<conventional-commit title>" --body "<summary>"
-gh pr merge <N> --repo <owner/repo> --auto --squash
 ```
 
-**Run the second command every single time, immediately after the first.** A PR
-opened without `--auto` sits waiting on a human who has already said they want it
-in — that is the exact babysitting this harness exists to delete.
+**Do not run `gh pr merge --auto` on your own initiative.** Merging stays a
+deliberate human act; an unarmed PR waiting on a human is the intended state,
+not a failure to automate.
 
-- **`--squash`**, not `--merge`: `core` forbids merge commits and enforces linear
-  history. `--rebase` also satisfies it; squash is the default choice.
-- **Auto-merge is not a bypass.** It fires only once GitHub's own rules are
-  satisfied. On `Femtum/core` that is **1 approving review + the `Validate All /
-  Success Gate` check**. The human still approves; they just stop having to come
-  back and click merge.
-- **Confirm it armed.** `gh pr merge --auto` fails loudly if the repo has
-  auto-merge disabled. Check with
+- **Arm auto-merge only on an explicit request** — "arm auto-merge", "let it
+  merge itself", "auto-merge this". Then, and only then:
+
+  ```
+  gh pr merge <N> --repo <owner/repo> --auto --squash
+  ```
+
+  **`--squash`**, not `--merge`: `core` forbids merge commits and enforces
+  linear history. `--rebase` also satisfies it; squash is the default choice.
+- **Never un-arm or merge without being asked either.** Both directions of merge
+  state are the human's call; you only ever execute what they said.
+- **When asked to arm it, confirm it took.** `gh pr merge --auto` fails loudly if
+  the repo has auto-merge disabled. Check with
   `gh api repos/<owner>/<repo> --jq .allow_auto_merge`. Current state:
 
   | repo | `allow_auto_merge` | required to merge |
@@ -529,13 +533,13 @@ in — that is the exact babysitting this harness exists to delete.
   | `Femtum/vision-lib` | ❌ false | — must be enabled in repo settings first |
   | `jsbed/dispatcher` | ❌ false | — must be enabled in repo settings first |
 
-  Where it is `false`, **say so and stop** — do not silently open a PR without
-  auto-merge, and do not flip the repo setting yourself without being asked.
+  Where it is `false`, **say so and stop** — do not flip the repo setting
+  yourself without being asked.
 - **A repo with no required approvals is a trap.** If a repo ever required zero
   reviews, `--auto` would merge the moment checks went green, unreviewed. Check
   the ruleset before arming auto-merge on a repo not in the table above.
-- Report the PR URL **and** that auto-merge is armed, so the human knows the only
-  thing left is their approval.
+- Report the PR URL, and say plainly that auto-merge is **not** armed, so the
+  human knows the merge is theirs to make (or to ask for).
 
 **Executors are unaffected.** Their contract still forbids merging, enabling
 auto-merge, or marking a PR ready — including autopilot tasks. Merge state is
